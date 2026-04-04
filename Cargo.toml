@@ -4,9 +4,19 @@ version = "0.1.0"
 edition = "2021"
 description = "Circom LSP server"
 
+[[bin]]
+name = "cinccino-lsp"
+path = "src/bin/cinccino_lsp.rs"
+
 [dependencies]
 logos = "0.15"
 thiserror = "2"
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dashmap = "6"
+ropey = "1"
 
 [dev-dependencies]
 insta = "1"

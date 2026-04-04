@@ -1,0 +1,325 @@
+use std::time::Duration;
+
+use serde_json::{json, Value};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::time::timeout;
+
+/// Helper to spawn the cinccino-lsp binary and communicate via JSON-RPC over
+/// stdin/stdout.
+struct LspClient {
+    child: Child,
+    reader: BufReader<tokio::process::ChildStdout>,
+    writer: tokio::process::ChildStdin,
+    next_id: i64,
+}
+
+impl LspClient {
+    async fn spawn() -> Self {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_cinccino-lsp"))
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn cinccino-lsp");
+
+        let stdin = child.stdin.take().unwrap();
+        let stdout = child.stdout.take().unwrap();
+
+        Self {
+            child,
+            reader: BufReader::new(stdout),
+            writer: stdin,
+            next_id: 1,
+        }
+    }
+
+    async fn request(&mut self, method: &str, params: Option<Value>) -> Value {
+        let id = self.next_id;
+        self.next_id += 1;
+
+        let mut msg = json!({ "jsonrpc": "2.0", "id": id, "method": method });
+        if let Some(p) = params {
+            msg["params"] = p;
+        }
+
+        self.send_message(&msg).await;
+        self.read_response(id).await
+    }
+
+    async fn notify(&mut self, method: &str, params: Option<Value>) {
+        let mut msg = json!({ "jsonrpc": "2.0", "method": method });
+        if let Some(p) = params {
+            msg["params"] = p;
+        }
+        self.send_message(&msg).await;
+    }
+
+    async fn send_message(&mut self, msg: &Value) {
+        let body = serde_json::to_string(msg).unwrap();
+        let header = format!("Content-Length: {}\r\n\r\n", body.len());
+        self.writer.write_all(header.as_bytes()).await.unwrap();
+        self.writer.write_all(body.as_bytes()).await.unwrap();
+        self.writer.flush().await.unwrap();
+    }
+
+    async fn read_response(&mut self, id: i64) -> Value {
+        loop {
+            let msg = self.read_message().await;
+            if let Some(resp_id) = msg.get("id") {
+                if resp_id.as_i64() == Some(id) {
+                    return msg;
+                }
+            }
+        }
+    }
+
+    async fn read_message(&mut self) -> Value {
+        timeout(Duration::from_secs(10), async {
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                self.reader.read_line(&mut line).await.unwrap();
+                let line = line.trim();
+                if line.is_empty() {
+                    break;
+                }
+                if let Some(len_str) = line.strip_prefix("Content-Length: ") {
+                    content_length = len_str.parse().unwrap();
+                }
+            }
+            assert!(content_length > 0, "missing Content-Length header");
+
+            let mut buf = vec![0u8; content_length];
+            tokio::io::AsyncReadExt::read_exact(&mut self.reader, &mut buf)
+                .await
+                .unwrap();
+            serde_json::from_slice::<Value>(&buf).unwrap()
+        })
+        .await
+        .expect("timed out reading LSP message")
+    }
+
+    async fn initialize(&mut self) -> Value {
+        let resp = self
+            .request(
+                "initialize",
+                Some(json!({
+                    "processId": null,
+                    "capabilities": {},
+                    "rootUri": null,
+                })),
+            )
+            .await;
+        self.notify("initialized", Some(json!({}))).await;
+        resp
+    }
+
+    async fn shutdown_and_exit(mut self) {
+        let resp = self.request("shutdown", None).await;
+        assert!(
+            resp.get("error").is_none(),
+            "shutdown returned error: {resp}"
+        );
+        self.notify("exit", None).await;
+        drop(self.writer);
+
+        match timeout(Duration::from_secs(2), self.child.wait()).await {
+            Ok(Ok(_)) => {}
+            _ => {
+                let _ = self.child.kill().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_initialize_returns_capabilities() {
+    let mut client = LspClient::spawn().await;
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert!(result.is_object(), "expected result object, got: {result}");
+
+    assert_eq!(result["serverInfo"]["name"], "cinccino");
+
+    let caps = &result["capabilities"];
+    let sync = &caps["textDocumentSync"];
+    assert_eq!(sync["openClose"], true);
+    assert_eq!(sync["change"], 2); // INCREMENTAL
+    assert_eq!(sync["save"]["includeText"], true);
+
+    assert_eq!(caps["workspace"]["workspaceFolders"]["supported"], true);
+    assert_eq!(
+        caps["workspace"]["workspaceFolders"]["changeNotifications"],
+        true
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_shutdown_then_exit() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_document_open_change_close() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/main.circom",
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": "pragma circom \"2.2.3\";\n"
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client
+        .notify(
+            "textDocument/didChange",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/main.circom",
+                    "version": 2
+                },
+                "contentChanges": [{
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 1, "character": 0 }
+                    },
+                    "text": "template Foo() {}\n"
+                }]
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client
+        .notify(
+            "textDocument/didClose",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/main.circom"
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_diagnostics_on_syntax_error() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/bad.circom",
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": "pragma circom \"2.2.3\"\ntemplate Foo() {}\n"
+                }
+            })),
+        )
+        .await;
+
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = client.read_message().await;
+            if msg.get("method") == Some(&json!("textDocument/publishDiagnostics")) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for diagnostics");
+
+    let params = &msg["params"];
+    assert_eq!(params["uri"], "file:///test/bad.circom");
+    let diagnostics = params["diagnostics"].as_array().unwrap();
+    assert!(
+        !diagnostics.is_empty(),
+        "expected at least one diagnostic for syntax error"
+    );
+    assert_eq!(diagnostics[0]["severity"], 1); // ERROR
+    assert_eq!(diagnostics[0]["source"], "cinccino");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_configuration_change_does_not_crash() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    client
+        .notify(
+            "workspace/didChangeConfiguration",
+            Some(json!({
+                "settings": {
+                    "circom": {
+                        "libraryPaths": ["/home/user/circomlib"]
+                    }
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_did_save_with_text() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/save.circom",
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": "pragma circom \"2.2.3\";\n"
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client
+        .notify(
+            "textDocument/didSave",
+            Some(json!({
+                "textDocument": {
+                    "uri": "file:///test/save.circom"
+                },
+                "text": "pragma circom \"2.2.3\";\ntemplate Bar() {}\n"
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    client.shutdown_and_exit().await;
+}
