@@ -3,6 +3,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use super::document_symbol;
 use super::DocumentStore;
 use crate::parser;
 use crate::span::LineIndex;
@@ -71,6 +72,7 @@ impl LanguageServer for CinccinoBackend {
                         ..Default::default()
                     },
                 )),
+                document_symbol_provider: Some(OneOf::Left(true)),
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -197,6 +199,22 @@ impl LanguageServer for CinccinoBackend {
                 )
                 .await;
         }
+    }
+
+    async fn document_symbol(
+        &self,
+        params: DocumentSymbolParams,
+    ) -> Result<Option<DocumentSymbolResponse>> {
+        let uri = params.text_document.uri;
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let (ast, _errors) = parser::parse(&text);
+        let symbols = document_symbol::document_symbols(&ast, &text);
+
+        Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<Value>> {

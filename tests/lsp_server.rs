@@ -155,6 +155,160 @@ async fn test_initialize_returns_capabilities() {
         true
     );
 
+    assert_eq!(caps["documentSymbolProvider"], true);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_document_symbol_returns_template_outline() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/symbols.circom";
+    let text = "pragma circom 2.0.0;\ntemplate Adder(n) {\n    signal input a;\n    signal input b;\n    signal output c;\n    c <== a + b;\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/documentSymbol",
+            Some(json!({
+                "textDocument": { "uri": uri }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array result");
+    assert_eq!(result.len(), 1, "expected 1 top-level symbol (template)");
+
+    let adder = &result[0];
+    assert_eq!(adder["name"], "Adder");
+    assert_eq!(adder["kind"], 5); // SymbolKind::CLASS = 5
+    assert_eq!(adder["detail"], "template");
+
+    let children = adder["children"].as_array().unwrap();
+    // n (param) + a, b (input) + c (output) = 4
+    assert_eq!(children.len(), 4);
+    assert_eq!(children[0]["name"], "n");
+    assert_eq!(children[1]["name"], "a");
+    assert_eq!(children[1]["kind"], 8); // SymbolKind::FIELD = 8
+    assert_eq!(children[2]["name"], "b");
+    assert_eq!(children[3]["name"], "c");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_document_symbol_empty_file() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/empty.circom";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": ""
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/documentSymbol",
+            Some(json!({
+                "textDocument": { "uri": uri }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array result");
+    assert!(result.is_empty(), "expected empty symbols for empty file");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_document_symbol_updates_on_change() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/update.circom";
+
+    // Open with one template
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": "template A() { signal input x; }\n"
+                }
+            })),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/documentSymbol",
+            Some(json!({ "textDocument": { "uri": uri } })),
+        )
+        .await;
+    let result = resp["result"].as_array().unwrap();
+    assert_eq!(result.len(), 1);
+    assert_eq!(result[0]["name"], "A");
+
+    // Replace content with two templates
+    client
+        .notify(
+            "textDocument/didChange",
+            Some(json!({
+                "textDocument": { "uri": uri, "version": 2 },
+                "contentChanges": [{
+                    "text": "template A() { signal input x; }\ntemplate B() { signal output y; }\n"
+                }]
+            })),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/documentSymbol",
+            Some(json!({ "textDocument": { "uri": uri } })),
+        )
+        .await;
+    let result = resp["result"].as_array().unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0]["name"], "A");
+    assert_eq!(result[1]["name"], "B");
+
     client.shutdown_and_exit().await;
 }
 
