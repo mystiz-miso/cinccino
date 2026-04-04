@@ -19,5 +19,10 @@ dashmap = "6"
 ropey = "1"
 
 [dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
 insta = "1"
 pretty_assertions = "1"
+
+[[bench]]
+name = "parse_bench"
+harness = false

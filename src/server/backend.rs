@@ -8,6 +8,8 @@ use super::DocumentStore;
 use crate::parser;
 use crate::span::LineIndex;
 
+use crate::parser::ParseError;
+
 /// The cinccino LSP server backend.
 pub struct CinccinoBackend {
     client: Client,
@@ -22,9 +24,15 @@ impl CinccinoBackend {
         }
     }
 
-    /// Parse a document and publish diagnostics.
-    async fn publish_diagnostics(&self, uri: Url, text: &str) {
-        let (_ast, errors) = parser::parse(text);
+    /// Publish diagnostics from cached incremental parse errors.
+    async fn publish_diagnostics_cached(&self, uri: Url) {
+        if let Some((text, errors)) = self.documents.get_parse_errors(&uri) {
+            self.publish_errors(uri, &text, errors).await;
+        }
+    }
+
+    /// Convert parse errors to LSP diagnostics and publish them.
+    async fn publish_errors(&self, uri: Url, text: &str, errors: Vec<ParseError>) {
         let line_index = LineIndex::new(text);
 
         let diagnostics: Vec<Diagnostic> = errors
@@ -128,8 +136,8 @@ impl LanguageServer for CinccinoBackend {
         let text = params.text_document.text;
         let version = params.text_document.version;
 
-        self.documents.open(uri.clone(), version, text.clone());
-        self.publish_diagnostics(uri, &text).await;
+        self.documents.open(uri.clone(), version, text);
+        self.publish_diagnostics_cached(uri).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -139,9 +147,9 @@ impl LanguageServer for CinccinoBackend {
         self.documents
             .apply_changes(&uri, version, params.content_changes);
 
-        if let Some(text) = self.documents.get_text(&uri) {
-            self.publish_diagnostics(uri, &text).await;
-        }
+        // Use the cached incremental parse result instead of a full
+        // re-parse.
+        self.publish_diagnostics_cached(uri).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -155,10 +163,13 @@ impl LanguageServer for CinccinoBackend {
     async fn did_save(&self, params: DidSaveTextDocumentParams) {
         let uri = params.text_document.uri;
         if let Some(text) = params.text {
-            // Re-parse with saved content.
-            self.publish_diagnostics(uri, &text).await;
+            // Reset the incremental parser so the next did_change starts
+            // from clean state, then re-publish diagnostics.
+            self.documents.reset_parser(&uri, &text);
+            self.publish_diagnostics_cached(uri).await;
         } else if let Some(text) = self.documents.get_text(&uri) {
-            self.publish_diagnostics(uri, &text).await;
+            self.documents.reset_parser(&uri, &text);
+            self.publish_diagnostics_cached(uri).await;
         }
     }
 
