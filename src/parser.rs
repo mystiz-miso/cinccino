@@ -310,7 +310,14 @@ impl Parser {
             Some(Token::Circom) => {
                 self.advance(); // eat `circom`
                 let version = self.parse_version();
-                self.version = Some(version.clone());
+                if self.version.is_some() {
+                    self.errors.push(ParseError {
+                        span: start.merge(self.prev_span()),
+                        message: "duplicate pragma circom declaration".into(),
+                    });
+                } else {
+                    self.version = Some(version.clone());
+                }
                 PragmaKind::Version(version)
             }
             Some(Token::Ident(s)) if s == "custom_templates" => {
@@ -1682,6 +1689,16 @@ mod tests {
             },
             _ => panic!("expected pragma item"),
         }
+    }
+
+    #[test]
+    fn test_duplicate_pragma_error() {
+        let (_, errors) = parse_with_errors("pragma circom 2.0.0; pragma circom 2.1.0;");
+        assert!(
+            errors.iter().any(|e| e.message.contains("duplicate")),
+            "should report error for duplicate pragma, got: {:?}",
+            errors
+        );
     }
 
     #[test]
