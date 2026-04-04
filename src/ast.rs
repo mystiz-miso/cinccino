@@ -40,7 +40,7 @@ pub enum PragmaKind {
     CustomTemplates,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Version {
     pub major: u32,
     pub minor: u32,

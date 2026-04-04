@@ -23,6 +23,8 @@ pub struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
     errors: Vec<ParseError>,
+    /// The declared `pragma circom` version, if any.
+    version: Option<Version>,
 }
 
 /// Parse a Circom source string into an AST, collecting errors.
@@ -33,6 +35,7 @@ pub fn parse(source: &str) -> (File, Vec<ParseError>) {
         tokens,
         pos: 0,
         errors: Vec::new(),
+        version: None,
     };
 
     // Convert lex errors
@@ -211,6 +214,22 @@ impl Parser {
         });
     }
 
+    /// Emit an error if the declared pragma version is below `min`.
+    /// No-op when no pragma has been seen (permissive by default).
+    fn require_version(&mut self, min: &Version, feature: &str, span: Span) {
+        if let Some(ref ver) = self.version {
+            if ver < min {
+                self.errors.push(ParseError {
+                    span,
+                    message: format!(
+                        "{} require pragma circom >= {}.{}.{}",
+                        feature, min.major, min.minor, min.patch
+                    ),
+                });
+            }
+        }
+    }
+
     /// Skip tokens until we find something that could start a new statement/item.
     fn synchronize(&mut self) {
         while !self.at_end() {
@@ -291,6 +310,7 @@ impl Parser {
             Some(Token::Circom) => {
                 self.advance(); // eat `circom`
                 let version = self.parse_version();
+                self.version = Some(version.clone());
                 PragmaKind::Version(version)
             }
             Some(Token::Ident(s)) if s == "custom_templates" => {
@@ -444,6 +464,15 @@ impl Parser {
 impl Parser {
     fn parse_bus_def(&mut self) -> BusDef {
         let start = self.current_span();
+        self.require_version(
+            &Version {
+                major: 2,
+                minor: 2,
+                patch: 0,
+            },
+            "bus definitions",
+            start,
+        );
         self.advance(); // eat `bus`
         let name = self.expect_ident();
         let params = self.parse_param_list();
@@ -688,6 +717,15 @@ impl Parser {
 
         // Check for bus type: `signal input BusName() { tags } name`
         if self.is_bus_type_ahead() {
+            self.require_version(
+                &Version {
+                    major: 2,
+                    minor: 2,
+                    patch: 0,
+                },
+                "bus instance declarations",
+                self.current_span(),
+            );
             let bus_type = self.parse_bus_type();
             let tags = self.parse_optional_tags();
             let name = self.expect_ident();
@@ -1152,6 +1190,7 @@ impl Parser {
     fn parse_optional_tags(&mut self) -> Vec<Identifier> {
         let mut tags = Vec::new();
         if self.eat(&Token::LBrace) {
+            let span = self.prev_span();
             if !self.check(&Token::RBrace) {
                 tags.push(self.expect_ident());
                 while self.eat(&Token::Comma) {
@@ -1159,6 +1198,15 @@ impl Parser {
                 }
             }
             self.expect(&Token::RBrace);
+            self.require_version(
+                &Version {
+                    major: 2,
+                    minor: 1,
+                    patch: 0,
+                },
+                "signal tags",
+                span,
+            );
         }
         tags
     }
@@ -2544,5 +2592,108 @@ mod tests {
             },
             _ => panic!("expected function"),
         }
+    }
+
+    // ── Version gate tests ──────────────────────────────────────
+
+    #[test]
+    fn test_tags_accepted_with_version_2_1_0() {
+        let src = "pragma circom 2.1.0; template T() { signal input {binary} x; }";
+        let file = parse_ok(src);
+        match &file.items[1] {
+            Item::TemplateDef(t) => match &t.body.stmts[0].kind {
+                StatementKind::SignalDecl(s) => {
+                    assert_eq!(s.tags.len(), 1);
+                    assert_eq!(s.tags[0].name, "binary");
+                }
+                _ => panic!("expected signal decl"),
+            },
+            _ => panic!("expected template"),
+        }
+    }
+
+    #[test]
+    fn test_tags_rejected_before_version_2_1_0() {
+        let src = "pragma circom 2.0.0; template T() { signal input {binary} x; }";
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("tags")),
+            "expected version gate error for tags, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_tags_accepted_with_higher_version() {
+        let src = "pragma circom 2.2.0; template T() { signal input {binary} x; }";
+        let file = parse_ok(src);
+        match &file.items[1] {
+            Item::TemplateDef(t) => match &t.body.stmts[0].kind {
+                StatementKind::SignalDecl(s) => {
+                    assert_eq!(s.tags.len(), 1);
+                }
+                _ => panic!("expected signal decl"),
+            },
+            _ => panic!("expected template"),
+        }
+    }
+
+    #[test]
+    fn test_bus_def_accepted_with_version_2_2_0() {
+        let src = "pragma circom 2.2.0; bus Point() { signal x; signal y; }";
+        let file = parse_ok(src);
+        assert_eq!(file.items.len(), 2);
+        assert!(matches!(&file.items[1], Item::BusDef(_)));
+    }
+
+    #[test]
+    fn test_bus_def_rejected_before_version_2_2_0() {
+        let src = "pragma circom 2.1.0; bus Point() { signal x; signal y; }";
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("bus")),
+            "expected version gate error for bus, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_bus_instance_rejected_before_version_2_2_0() {
+        let src =
+            "pragma circom 2.1.0; bus Point() { signal x; } template T() { signal input Point() p; }";
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("bus")),
+            "expected version gate error for bus instance, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_bus_accepted_with_version_2_2_3() {
+        let src = "pragma circom 2.2.3; bus Point() { signal x; }";
+        let file = parse_ok(src);
+        assert!(matches!(&file.items[1], Item::BusDef(_)));
+    }
+
+    #[test]
+    fn test_no_pragma_allows_all_features() {
+        // Without a pragma, no version gate errors
+        let src = "bus Point() { signal x; }";
+        let file = parse_ok(src);
+        assert!(matches!(&file.items[0], Item::BusDef(_)));
+    }
+
+    #[test]
+    fn test_tags_in_bus_rejected_before_2_1_0() {
+        let src = "pragma circom 2.0.0; bus Book() { signal {maxvalue} title[50]; }";
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.message.contains("tags") || e.message.contains("bus")),
+            "expected version gate error, got: {:?}",
+            errors
+        );
     }
 }
