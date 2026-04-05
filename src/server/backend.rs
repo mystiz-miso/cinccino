@@ -4,9 +4,11 @@ use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
 use super::document_symbol;
+use super::signature_help as sig_help;
 use super::DocumentStore;
 use crate::parser;
 use crate::span::LineIndex;
+use crate::symbol_table::SymbolTable;
 
 use crate::parser::ParseError;
 
@@ -81,6 +83,11 @@ impl LanguageServer for CinccinoBackend {
                     },
                 )),
                 document_symbol_provider: Some(OneOf::Left(true)),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: Some(vec![",".to_string()]),
+                    work_done_progress_options: Default::default(),
+                }),
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -226,6 +233,49 @@ impl LanguageServer for CinccinoBackend {
         let symbols = document_symbol::document_symbols(&ast, &text);
 
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let line_index = LineIndex::new(&text);
+
+        // Convert LSP position to byte offset.
+        let line = position.line as usize;
+        let col = position.character as usize;
+        let offset = line_index.offset(line, col).unwrap_or(text.len());
+
+        // Find the call site at the cursor position.
+        let call_site = match sig_help::find_call_site(&text, offset) {
+            Some(cs) => cs,
+            None => return Ok(None),
+        };
+
+        // Check for built-in functions first.
+        if let Some(help) =
+            sig_help::builtin_signature_help(&call_site.name, call_site.active_param)
+        {
+            return Ok(Some(help));
+        }
+
+        // Parse and build a symbol table to look up the definition.
+        let (ast, _) = parser::parse(&text);
+        let mut symbol_table = SymbolTable::new();
+        let file_path = uri.as_str();
+        symbol_table.index_file(file_path, &ast);
+
+        Ok(sig_help::signature_help(
+            &text,
+            offset,
+            &symbol_table,
+            file_path,
+        ))
     }
 
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<Value>> {

@@ -179,6 +179,14 @@ async fn initialize_returns_capabilities() {
 
     assert_eq!(result["capabilities"]["documentSymbolProvider"], true);
 
+    let sig_help = &result["capabilities"]["signatureHelpProvider"];
+    assert!(sig_help.is_object(), "expected signatureHelpProvider");
+    let triggers = sig_help["triggerCharacters"]
+        .as_array()
+        .expect("expected triggerCharacters");
+    assert!(triggers.contains(&json!("(")));
+    assert!(triggers.contains(&json!(",")));
+
     client.shutdown_and_exit().await;
 }
 
@@ -602,6 +610,174 @@ async fn diagnostics_cleared_on_fix() {
         )
         .await;
     tokio::time::sleep(Duration::from_millis(100)).await;
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── signature_help ─────────────────────
+
+#[tokio::test]
+async fn signature_help_template_instantiation() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig.circom";
+    let text = "template Poseidon(nInputs) {\n    signal input in;\n}\ntemplate T() {\n    component c = Poseidon(2);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor after '(' in `Poseidon(`  -> line 4, col 27
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 4, "character": 27 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help, got null");
+    let sigs = result["signatures"].as_array().unwrap();
+    assert_eq!(sigs.len(), 1);
+    assert_eq!(sigs[0]["label"], "Poseidon(nInputs)");
+    assert_eq!(result["activeParameter"], 0);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn signature_help_function_call() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig_fn.circom";
+    let text = "function nbits(n) {\n    return n;\n}\ntemplate T() {\n    var x = nbits(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor after '(' in `nbits(` -> line 4, col 18
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 4, "character": 18 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help");
+    assert_eq!(result["signatures"][0]["label"], "nbits(n)");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn signature_help_active_param_on_comma() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig_comma.circom";
+    let text =
+        "function add(a, b) {\n    return a + b;\n}\ntemplate T() {\n    var x = add(1, 2);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor after comma: `add(1, |2)` -> line 4, col 19
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 4, "character": 19 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help");
+    assert_eq!(result["signatures"][0]["label"], "add(a, b)");
+    assert_eq!(result["activeParameter"], 1);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn signature_help_builtin_log() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig_log.circom";
+    let text = "template T() {\n    log(42);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor after '(' in `log(` -> line 1, col 8
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 8 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help for log");
+    assert_eq!(result["signatures"][0]["label"], "log(expr, ...)");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn signature_help_builtin_assert() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig_assert.circom";
+    let text = "template T() {\n    assert(1);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor after '(' in `assert(` -> line 1, col 11
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 11 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help for assert");
+    assert_eq!(result["signatures"][0]["label"], "assert(condition)");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn signature_help_outside_call_returns_null() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/sig_none.circom";
+    let text = "template T() {\n    var x = 1;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor at `1` -> line 1, col 12
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 12 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(result.is_null(), "expected null outside call context");
 
     client.shutdown_and_exit().await;
 }

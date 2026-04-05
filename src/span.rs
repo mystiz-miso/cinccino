@@ -62,6 +62,20 @@ impl LineIndex {
         Self { line_starts }
     }
 
+    /// Convert a 0-based line/column position to a byte offset.
+    ///
+    /// Returns `None` if `line` is out of range.
+    ///
+    /// **Note**: `col` is treated as a byte offset from the line start, but
+    /// LSP `Position.character` is defined as a UTF-16 code unit offset.
+    /// For ASCII source this is equivalent; non-ASCII characters before the
+    /// cursor on the same line would cause a mismatch. This is acceptable
+    /// because Circom identifiers and syntax are ASCII-only.
+    pub fn offset(&self, line: usize, col: usize) -> Option<usize> {
+        let start = *self.line_starts.get(line)?;
+        Some(start + col)
+    }
+
     /// Convert a byte offset to a 0-based line/column position.
     ///
     /// Returns `None` if `offset` is beyond the source length.

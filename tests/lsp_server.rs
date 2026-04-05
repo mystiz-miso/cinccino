@@ -477,3 +477,85 @@ async fn test_did_save_with_text() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     client.shutdown_and_exit().await;
 }
+
+#[tokio::test]
+async fn test_signature_help_on_template_call() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/sig_help.circom";
+    let text = "template Poseidon(nInputs) {\n    signal input in;\n}\ntemplate T() {\n    component c = Poseidon(2);\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 4, "character": 27 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected signature help");
+    assert_eq!(result["signatures"][0]["label"], "Poseidon(nInputs)");
+    assert_eq!(result["activeParameter"], 0);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_signature_help_returns_null_outside_call() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/sig_none.circom";
+    let text = "template T() {\n    var x = 1;\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/signatureHelp",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 12 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(result.is_null(), "expected null outside call");
+
+    client.shutdown_and_exit().await;
+}
