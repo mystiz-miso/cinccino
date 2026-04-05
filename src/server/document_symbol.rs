@@ -512,4 +512,70 @@ mod tests {
         );
         assert!(symbols.is_empty());
     }
+
+    #[test]
+    fn main_component_without_public() {
+        let symbols = symbols_for(
+            r#"
+            pragma circom 2.0.0;
+            template Foo() { signal input x; }
+            component main = Foo();
+        "#,
+        );
+
+        let main = symbols.iter().find(|s| s.name == "main").unwrap();
+        assert_eq!(main.kind, SymbolKind::CONSTANT);
+        assert_eq!(main.detail.as_deref(), Some("main component"));
+    }
+
+    #[test]
+    fn component_without_init() {
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                component c;
+            }
+        "#,
+        );
+
+        let children = symbols[0].children.as_ref().unwrap();
+        assert_eq!(children[0].name, "c");
+        assert_eq!(children[0].detail.as_deref(), Some("component"));
+    }
+
+    #[test]
+    fn signal_with_tags() {
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                signal input {binary} a;
+            }
+        "#,
+        );
+
+        let children = symbols[0].children.as_ref().unwrap();
+        assert_eq!(children[0].name, "a");
+        assert!(
+            children[0].detail.as_deref().unwrap().contains("binary"),
+            "detail: {:?}",
+            children[0].detail
+        );
+    }
+
+    #[test]
+    fn multiple_signals_in_one_decl() {
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                signal input a, b, c;
+            }
+        "#,
+        );
+
+        let children = symbols[0].children.as_ref().unwrap();
+        assert_eq!(children.len(), 3);
+        assert_eq!(children[0].name, "a");
+        assert_eq!(children[1].name, "b");
+        assert_eq!(children[2].name, "c");
+    }
 }

@@ -138,6 +138,7 @@ dependencies = [
  "ropey",
  "serde",
  "serde_json",
+ "similar",
  "thiserror",
  "tokio",
  "tower-lsp",

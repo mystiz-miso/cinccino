@@ -130,4 +130,17 @@ mod tests {
         let merged = a.merge(b);
         assert_eq!(merged, Span::new(5, 15));
     }
+
+    #[test]
+    fn test_span_default() {
+        let span = Span::default();
+        assert_eq!(span, Span::dummy());
+    }
+
+    #[test]
+    fn test_line_col_beyond_end() {
+        let idx = LineIndex::new("ab\ncd");
+        // Offset beyond end
+        assert_eq!(idx.line_col(100), Some(LineCol { line: 1, col: 97 }));
+    }
 }
