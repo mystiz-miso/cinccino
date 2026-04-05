@@ -700,6 +700,184 @@ function bar() { return 1; }
     }
 
     #[test]
+    fn shift_template_with_various_statements() {
+        // Template with many statement types after the edited item
+        // exercises shift_item_spans(TemplateDef), shift_stmt for
+        // VarDecl, SignalDecl, ComponentDecl, Assignment, ConstraintEq,
+        // IfElse, For, While, Log, Assert, Return, and their child
+        // expression variants.
+        let old_src = concat!(
+            "function f() { return 1; }\n",
+            "template T(n) {\n",
+            "    signal input a;\n",
+            "    signal output b;\n",
+            "    var x = 0;\n",
+            "    component h = Poseidon(2);\n",
+            "    x = a + b;\n",
+            "    b <== a * 2;\n",
+            "    if (n > 0) { x = 1; } else { x = 2; }\n",
+            "    for (var i = 0; i < n; i++) { x += 1; }\n",
+            "    while (x > 0) { x -= 1; }\n",
+            "    log(x);\n",
+            "    assert(x == 0);\n",
+            "}\n",
+        );
+        let new_src = concat!(
+            "function ff() { return 1; }\n",
+            "template T(n) {\n",
+            "    signal input a;\n",
+            "    signal output b;\n",
+            "    var x = 0;\n",
+            "    component h = Poseidon(2);\n",
+            "    x = a + b;\n",
+            "    b <== a * 2;\n",
+            "    if (n > 0) { x = 1; } else { x = 2; }\n",
+            "    for (var i = 0; i < n; i++) { x += 1; }\n",
+            "    while (x > 0) { x -= 1; }\n",
+            "    log(x);\n",
+            "    assert(x == 0);\n",
+            "}\n",
+        );
+
+        let mut inc = IncrementalParser::parse(old_src);
+        let edit_start = old_src.find(" f(").unwrap() + 1;
+        let edit = TextEdit {
+            start: edit_start,
+            removed: 1,  // "f"
+            inserted: 2, // "ff"
+        };
+
+        let (inc_file, inc_errors) = inc.update(new_src, &edit);
+        let (full_file, full_errors) = full_parse(new_src);
+        assert_eq!(inc_file, full_file);
+        assert_eq!(inc_errors, full_errors);
+    }
+
+    #[test]
+    fn shift_bus_and_main_component() {
+        // Bus definition and main component after the edited item
+        // exercises shift_item_spans for BusDef and MainComponent,
+        // plus shift_bus_member and shift_bus_type.
+        let old_src = concat!(
+            "pragma circom 2.2.0;\n",
+            "function f() { return 1; }\n",
+            "bus Point() {\n",
+            "    signal input x;\n",
+            "    signal input y;\n",
+            "}\n",
+            "template Foo() { signal input a; }\n",
+            "component main { public [a] } = Foo();\n",
+        );
+        let new_src = concat!(
+            "pragma circom 2.2.0;\n",
+            "function ff() { return 1; }\n",
+            "bus Point() {\n",
+            "    signal input x;\n",
+            "    signal input y;\n",
+            "}\n",
+            "template Foo() { signal input a; }\n",
+            "component main { public [a] } = Foo();\n",
+        );
+
+        let mut inc = IncrementalParser::parse(old_src);
+        let edit_start = old_src.find(" f(").unwrap() + 1;
+        let edit = TextEdit {
+            start: edit_start,
+            removed: 1,  // "f"
+            inserted: 2, // "ff"
+        };
+
+        let (inc_file, inc_errors) = inc.update(new_src, &edit);
+        let (full_file, full_errors) = full_parse(new_src);
+        assert_eq!(inc_file, full_file);
+        assert_eq!(inc_errors, full_errors);
+    }
+
+    #[test]
+    fn shift_expressions_complex() {
+        // Exercises shift_expr for Ternary, Index, Member, Call,
+        // ArrayLit, Unary, Paren, and Binary variants.
+        let old_src = concat!(
+            "function f() { return 1; }\n",
+            "function g(n) {\n",
+            "    var a;\n",
+            "    var b;\n",
+            "    a = n > 0 ? 1 : 0;\n",
+            "    b = (a + 1) * -n;\n",
+            "    return a;\n",
+            "}\n",
+        );
+        let new_src = concat!(
+            "function ff() { return 1; }\n",
+            "function g(n) {\n",
+            "    var a;\n",
+            "    var b;\n",
+            "    a = n > 0 ? 1 : 0;\n",
+            "    b = (a + 1) * -n;\n",
+            "    return a;\n",
+            "}\n",
+        );
+
+        let mut inc = IncrementalParser::parse(old_src);
+        let edit_start = old_src.find(" f(").unwrap() + 1;
+        let edit = TextEdit {
+            start: edit_start,
+            removed: 1,
+            inserted: 2,
+        };
+
+        let (inc_file, inc_errors) = inc.update(new_src, &edit);
+        let (full_file, full_errors) = full_parse(new_src);
+        assert_eq!(inc_file, full_file);
+        assert_eq!(inc_errors, full_errors);
+    }
+
+    #[test]
+    fn shift_tuple_assign_and_block_stmt() {
+        // Exercises shift_stmt for TupleAssign, CompoundAssign,
+        // Increment, Decrement, Block, and Expression statements.
+        let old_src = concat!(
+            "function f() { return 1; }\n",
+            "function g() {\n",
+            "    var a;\n",
+            "    var b;\n",
+            "    (a, b) = (1, 2);\n",
+            "    a++;\n",
+            "    b--;\n",
+            "    a += 1;\n",
+            "    { a = 0; }\n",
+            "    return a;\n",
+            "}\n",
+        );
+        let new_src = concat!(
+            "function ff() { return 1; }\n",
+            "function g() {\n",
+            "    var a;\n",
+            "    var b;\n",
+            "    (a, b) = (1, 2);\n",
+            "    a++;\n",
+            "    b--;\n",
+            "    a += 1;\n",
+            "    { a = 0; }\n",
+            "    return a;\n",
+            "}\n",
+        );
+
+        let mut inc = IncrementalParser::parse(old_src);
+        let edit_start = old_src.find(" f(").unwrap() + 1;
+        let edit = TextEdit {
+            start: edit_start,
+            removed: 1,
+            inserted: 2,
+        };
+
+        let (inc_file, inc_errors) = inc.update(new_src, &edit);
+        let (full_file, full_errors) = full_parse(new_src);
+        assert_eq!(inc_file, full_file);
+        assert_eq!(inc_errors, full_errors);
+    }
+
+    #[test]
     fn errors_preserved_across_items_after_edit() {
         // Template A has a syntax error; template B is valid.
         // Editing B should preserve A's error.

@@ -415,6 +415,17 @@ impl Parser {
 
         // Parse optional `extern`
         let is_extern = self.eat(&Token::Extern);
+        if is_extern {
+            self.require_version(
+                &Version {
+                    major: 2,
+                    minor: 2,
+                    patch: 3,
+                },
+                "extern templates",
+                start,
+            );
+        }
 
         // Parse optional `parallel`
         let is_parallel = self.eat(&Token::Parallel);
@@ -2712,5 +2723,67 @@ mod tests {
             "expected version gate error, got: {:?}",
             errors
         );
+    }
+
+    #[test]
+    fn test_extern_template_accepted_with_version_2_2_3() {
+        let src = r#"
+            pragma circom 2.2.3;
+            pragma custom_templates;
+            template custom extern A() { signal input in; signal output out; }
+        "#;
+        let file = parse_ok(src);
+        match &file.items[2] {
+            Item::TemplateDef(t) => {
+                assert!(t.is_extern);
+                assert!(t.is_custom);
+            }
+            _ => panic!("expected template"),
+        }
+    }
+
+    #[test]
+    fn test_extern_template_rejected_before_version_2_2_3() {
+        let src = r#"
+            pragma circom 2.2.0;
+            pragma custom_templates;
+            template custom extern A() { signal input in; signal output out; }
+        "#;
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("extern")),
+            "expected version gate error for extern templates, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_extern_template_rejected_with_version_2_1_0() {
+        let src = r#"
+            pragma circom 2.1.0;
+            pragma custom_templates;
+            template custom extern B() { signal input in; }
+        "#;
+        let (_, errors) = parse_with_errors(src);
+        assert!(
+            errors.iter().any(|e| e.message.contains("extern")),
+            "expected version gate error for extern templates, got: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_no_pragma_allows_extern_template() {
+        let src = r#"
+            pragma custom_templates;
+            template custom extern A() { signal input in; signal output out; }
+        "#;
+        let file = parse_ok(src);
+        match &file.items[1] {
+            Item::TemplateDef(t) => {
+                assert!(t.is_extern);
+            }
+            _ => panic!("expected template"),
+        }
     }
 }
