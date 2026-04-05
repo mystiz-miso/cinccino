@@ -454,7 +454,7 @@ impl Parser {
         // Parse optional `parallel`
         let is_parallel = self.eat(&Token::Parallel);
 
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let params = self.parse_param_list();
         let body = self.parse_block();
 
@@ -489,7 +489,7 @@ impl Parser {
     fn parse_function_def(&mut self) -> FunctionDef {
         let start = self.current_span();
         self.advance(); // eat `function`
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let params = self.parse_param_list();
         let body = self.parse_block();
         FunctionDef {
@@ -516,7 +516,7 @@ impl Parser {
             start,
         );
         self.advance(); // eat `bus`
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let params = self.parse_param_list();
         self.expect(&Token::LBrace);
         let mut body = Vec::new();
@@ -558,7 +558,7 @@ impl Parser {
         let start = self.current_span();
         let bus_type = self.parse_bus_type();
         let tags = self.parse_optional_tags();
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let dimensions = self.parse_dimensions();
         self.expect_semi();
         BusFieldDecl {
@@ -2501,6 +2501,58 @@ mod tests {
 
         let src = "pragma circom 2.2.0; template T() { signal input MyBus() main; }";
         let _file = parse_ok(src);
+    }
+
+    #[test]
+    fn test_template_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("template {}() {{}}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for template named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_function_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("function {}() {{ return 0; }}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for function named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_bus_def_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("pragma circom 2.2.0; bus {}() {{}}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for bus named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_bus_field_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("pragma circom 2.2.0; bus B() {{ MyBus() {}; }}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for bus field named `{}`, but got none",
+                kw,
+            );
+        }
     }
 
     // ── Complex integration tests ───────────────────────────────
