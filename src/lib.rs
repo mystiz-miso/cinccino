@@ -5,7 +5,6 @@ pub mod parser;
 pub mod pretty_print;
 pub mod server;
 pub mod span;
-pub mod trivia;
 pub mod visitor;
 pub mod walker;
 

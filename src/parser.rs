@@ -170,6 +170,30 @@ impl Parser {
         }
     }
 
+    /// Returns `true` for keywords that must not be used as declaration names
+    /// (signal, variable, or component names). `main` is a contextual keyword
+    /// and is intentionally excluded — it may appear as an identifier.
+    fn is_reserved_keyword(token: &Token) -> bool {
+        Self::keyword_as_ident(token).is_some() && !matches!(token, Token::Main)
+    }
+
+    /// Like `expect_ident`, but rejects reserved keywords as declaration names.
+    fn expect_decl_name(&mut self) -> Identifier {
+        if let Some(tok) = self.peek() {
+            if Self::is_reserved_keyword(tok) {
+                let span = self.current_span();
+                let name = Self::keyword_as_ident(tok).unwrap();
+                self.error(format!("keyword `{}` cannot be used as a name", name));
+                self.advance();
+                return Identifier {
+                    span,
+                    name: name.into(),
+                };
+            }
+        }
+        self.expect_ident()
+    }
+
     fn expect_ident(&mut self) -> Identifier {
         match self.peek() {
             Some(Token::Ident(_)) => {
@@ -703,7 +727,7 @@ impl Parser {
     }
 
     fn parse_var_decl_entry(&mut self) -> VarDeclEntry {
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let dimensions = self.parse_dimensions();
         let init = if self.eat(&Token::Eq) {
             Some(self.parse_expression())
@@ -746,7 +770,7 @@ impl Parser {
             );
             let bus_type = self.parse_bus_type();
             let tags = self.parse_optional_tags();
-            let name = self.expect_ident();
+            let name = self.expect_decl_name();
             let dimensions = self.parse_dimensions();
 
             let init = if self.check(&Token::LeftSignalAssign) {
@@ -831,7 +855,7 @@ impl Parser {
     }
 
     fn parse_signal_decl_entry(&mut self) -> SignalDeclEntry {
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let dimensions = self.parse_dimensions();
 
         let init = if self.check(&Token::LeftSignalAssign) {
@@ -879,7 +903,7 @@ impl Parser {
     }
 
     fn parse_component_decl_entry(&mut self, is_parallel: &mut bool) -> ComponentDeclEntry {
-        let name = self.expect_ident();
+        let name = self.expect_decl_name();
         let dimensions = self.parse_dimensions();
         let init = if self.eat(&Token::Eq) {
             // `parallel` can appear after `=` for per-component parallelism
@@ -1683,6 +1707,23 @@ mod tests {
         parse(src)
     }
 
+    const RESERVED_KEYWORDS: [&str; 14] = [
+        "signal",
+        "template",
+        "function",
+        "component",
+        "var",
+        "bus",
+        "input",
+        "output",
+        "public",
+        "custom",
+        "parallel",
+        "extern",
+        "log",
+        "assert",
+    ];
+
     // ── Pragma tests ────────────────────────────────────────────
 
     #[test]
@@ -2389,6 +2430,77 @@ mod tests {
         let (_file, errors) = parse_with_errors("template T() { signal a signal b signal c; }");
         // Parser should report multiple errors, not just the first
         assert!(errors.len() >= 1);
+    }
+
+    #[test]
+    fn test_signal_named_as_keyword() {
+        // Reserved keywords must not be accepted as signal names
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("template T() {{ signal input {}; }}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for signal named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_var_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("template T() {{ var {}; }}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for var named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_component_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!("template T() {{ component {} = Foo(); }}", kw);
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for component named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_bus_instance_named_as_keyword() {
+        for kw in RESERVED_KEYWORDS {
+            let src = format!(
+                "pragma circom 2.2.0; template T() {{ signal input MyBus() {}; }}",
+                kw
+            );
+            let (_file, errors) = parse_with_errors(&src);
+            assert!(
+                !errors.is_empty(),
+                "expected error for bus instance named `{}`, but got none",
+                kw,
+            );
+        }
+    }
+
+    #[test]
+    fn test_main_allowed_as_identifier() {
+        // `main` is a contextual keyword — allowed as a signal, var, and bus
+        // instance name. Note: `component main` is excluded because it has
+        // special top-level semantics in circom (`component main = ...`).
+        let src = "template T() { signal input main; }";
+        let _file = parse_ok(src);
+
+        let src = "template T() { var main; }";
+        let _file = parse_ok(src);
+
+        let src = "pragma circom 2.2.0; template T() { signal input MyBus() main; }";
+        let _file = parse_ok(src);
     }
 
     // ── Complex integration tests ───────────────────────────────
