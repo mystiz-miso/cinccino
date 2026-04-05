@@ -906,4 +906,431 @@ function bar() { return 1; }
             "errors from unaffected items must be preserved after an edit to a different item"
         );
     }
+
+    /// Helper: apply an edit at the start of the first item (rename it),
+    /// then assert the incremental result matches a full parse of the new
+    /// source.  This exercises `shift_item_spans` on every item after the
+    /// edit.
+    fn assert_shift_after_rename(old_src: &str, new_src: &str) {
+        let mut inc = IncrementalParser::parse(old_src);
+        // The edit replaces the old first-item text with the new one.
+        // We find the difference by comparing the two sources.
+        let edit = TextEdit {
+            start: 0,
+            removed: old_src.find('\n').unwrap(),
+            inserted: new_src.find('\n').unwrap(),
+        };
+        let (inc_file, inc_errors) = inc.update(new_src, &edit);
+        let (full_file, full_errors) = full_parse(new_src);
+        assert_eq!(inc_file, full_file);
+        assert_eq!(inc_errors, full_errors);
+    }
+
+    #[test]
+    fn shift_var_decl_and_signal_decl() {
+        // VarDecl with init + dimensions, SignalDecl with tags
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  var x = 1;\n",
+            "  var arr[3];\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  a ==> b;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  var x = 1;\n",
+            "  var arr[3];\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  a ==> b;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_component_decl_and_assignment() {
+        // ComponentDecl, Assignment with signal ops
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  component c;\n",
+            "  b <== a;\n",
+            "  a <-- 1;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  component c;\n",
+            "  b <== a;\n",
+            "  a <-- 1;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_if_else_and_for_loop() {
+        // IfElse with else branch, ForLoop
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T(n) {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  if (n > 0) {\n",
+            "    b <== a;\n",
+            "  } else {\n",
+            "    b <== 0;\n",
+            "  }\n",
+            "  for (var i = 0; i < n; i++) {\n",
+            "    var x = i;\n",
+            "  }\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T(n) {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  if (n > 0) {\n",
+            "    b <== a;\n",
+            "  } else {\n",
+            "    b <== 0;\n",
+            "  }\n",
+            "  for (var i = 0; i < n; i++) {\n",
+            "    var x = i;\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_while_loop_and_return() {
+        // WhileLoop and Return
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "function g(n) {\n",
+            "  var x = 1;\n",
+            "  while (x < n) {\n",
+            "    x = x + 1;\n",
+            "  }\n",
+            "  return x;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "function g(n) {\n",
+            "  var x = 1;\n",
+            "  while (x < n) {\n",
+            "    x = x + 1;\n",
+            "  }\n",
+            "  return x;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_log_and_assert() {
+        // Log with expression arg, Assert
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  log(a);\n",
+            "  assert(a);\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  log(a);\n",
+            "  assert(a);\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_compound_assign_and_constraint_eq() {
+        // CompoundAssign, ConstraintEq
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  var x = 1;\n",
+            "  x += 2;\n",
+            "  a === b;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  var x = 1;\n",
+            "  x += 2;\n",
+            "  a === b;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_ternary_index_member_call() {
+        // Ternary, Index, Member, Call expressions
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "function g(n) {\n",
+            "  var a[3];\n",
+            "  var x = n > 0 ? a[0] : a[1];\n",
+            "  return x;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "function g(n) {\n",
+            "  var a[3];\n",
+            "  var x = n > 0 ? a[0] : a[1];\n",
+            "  return x;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_array_literal() {
+        // ArrayLit expression
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "function g() {\n",
+            "  var x = [1, 2, 3];\n",
+            "  return x;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "function g() {\n",
+            "  var x = [1, 2, 3];\n",
+            "  return x;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_increment_decrement() {
+        // Increment and Decrement statements
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "function g() {\n",
+            "  var x = 0;\n",
+            "  x++;\n",
+            "  x--;\n",
+            "  return x;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "function g() {\n",
+            "  var x = 0;\n",
+            "  x++;\n",
+            "  x--;\n",
+            "  return x;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_main_component() {
+        // MainComponent item
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "}\n",
+            "component main {public [a]} = T();\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "}\n",
+            "component main {public [a]} = T();\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_include_item() {
+        // Include item
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "include \"circomlib/circuits/bitify.circom\";\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "include \"circomlib/circuits/bitify.circom\";\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_tuple_assign() {
+        // TupleAssign statement
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  signal output c;\n",
+            "  (b, c) <== (a, a);\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  signal output c;\n",
+            "  (b, c) <== (a, a);\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_signal_with_init() {
+        // SignalDecl with initialization
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b <== a;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  signal output b <== a;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_component_with_init() {
+        // ComponentDecl with initialization
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template Inner() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  b <== a;\n",
+            "}\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  component c = Inner();\n",
+            "  c.a <== a;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template Inner() {\n",
+            "  signal input a;\n",
+            "  signal output b;\n",
+            "  b <== a;\n",
+            "}\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  component c = Inner();\n",
+            "  c.a <== a;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_nested_block() {
+        // Block statement (nested block inside template)
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  {\n",
+            "    var x = a;\n",
+            "  }\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T() {\n",
+            "  signal input a;\n",
+            "  {\n",
+            "    var x = a;\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_unary_and_paren_expr() {
+        // Unary and Paren expressions
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "function g(n) {\n",
+            "  var x = -(n);\n",
+            "  return x;\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "function g(n) {\n",
+            "  var x = -(n);\n",
+            "  return x;\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
+
+    #[test]
+    fn shift_signal_with_dimensions() {
+        // SignalDecl with array dimensions
+        let base = concat!(
+            "function f() { return 0; }\n",
+            "template T(n) {\n",
+            "  signal input a[n];\n",
+            "  signal output b[n];\n",
+            "  for (var i = 0; i < n; i++) {\n",
+            "    b[i] <== a[i];\n",
+            "  }\n",
+            "}\n",
+        );
+        let renamed = concat!(
+            "function ff() { return 0; }\n",
+            "template T(n) {\n",
+            "  signal input a[n];\n",
+            "  signal output b[n];\n",
+            "  for (var i = 0; i < n; i++) {\n",
+            "    b[i] <== a[i];\n",
+            "  }\n",
+            "}\n",
+        );
+        assert_shift_after_rename(base, renamed);
+    }
 }
