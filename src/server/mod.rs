@@ -1,4 +1,5 @@
 mod backend;
+mod completion;
 mod document;
 pub mod document_symbol;
 pub mod signature_help;

@@ -587,6 +587,208 @@ async fn full_lifecycle_open_change_save_close_shutdown() {
     client.shutdown_and_exit().await;
 }
 
+// ───────────────────── completion ─────────────────────
+
+#[tokio::test]
+async fn completion_top_level_returns_keywords() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client
+        .open_doc("file:///test/comp.circom", "pragma circom \"2.2.3\";\n")
+        .await;
+
+    let resp = client
+        .request(
+            "textDocument/completion",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/comp.circom" },
+                "position": { "line": 1, "character": 0 }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    let labels: Vec<&str> = result
+        .iter()
+        .map(|i| i["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        labels.contains(&"template"),
+        "should contain template keyword: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"function"),
+        "should contain function keyword: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"include"),
+        "should contain include keyword: {labels:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn completion_inside_template_returns_signals() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client
+        .open_doc(
+            "file:///test/tmpl.circom",
+            "template Foo(n) {\n    signal input x;\n    \n}\n",
+        )
+        .await;
+
+    let resp = client
+        .request(
+            "textDocument/completion",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/tmpl.circom" },
+                "position": { "line": 2, "character": 4 }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    let labels: Vec<&str> = result
+        .iter()
+        .map(|i| i["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        labels.contains(&"signal input"),
+        "should contain signal keyword: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"var"),
+        "should contain var keyword: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"x"),
+        "should contain signal name x: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"n"),
+        "should contain parameter n: {labels:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn completion_dot_access_returns_signals() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client
+        .open_doc(
+            "file:///test/dot.circom",
+            concat!(
+                "template Inner() {\n",
+                "    signal input a;\n",
+                "    signal output b;\n",
+                "}\n",
+                "template Outer() {\n",
+                "    component c = Inner();\n",
+                "    c.\n",
+                "}\n",
+            ),
+        )
+        .await;
+
+    let resp = client
+        .request(
+            "textDocument/completion",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/dot.circom" },
+                "position": { "line": 6, "character": 6 }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    let labels: Vec<&str> = result
+        .iter()
+        .map(|i| i["label"].as_str().unwrap())
+        .collect();
+    assert!(labels.contains(&"a"), "should contain signal a: {labels:?}");
+    assert!(labels.contains(&"b"), "should contain signal b: {labels:?}");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn completion_pragma_returns_versions() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client
+        .open_doc("file:///test/pragma.circom", "pragma circom ")
+        .await;
+
+    let resp = client
+        .request(
+            "textDocument/completion",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/pragma.circom" },
+                "position": { "line": 0, "character": 14 }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    let labels: Vec<&str> = result
+        .iter()
+        .map(|i| i["label"].as_str().unwrap())
+        .collect();
+    assert!(
+        labels.contains(&"2.2.3"),
+        "should contain version 2.2.3: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"2.0.0"),
+        "should contain version 2.0.0: {labels:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn completion_returns_null_for_unknown_uri() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let resp = client
+        .request(
+            "textDocument/completion",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/unknown.circom" },
+                "position": { "line": 0, "character": 0 }
+            })),
+        )
+        .await;
+
+    assert!(resp["result"].is_null(), "expected null for unknown URI");
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn initialize_advertises_completion_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    let completion = &result["capabilities"]["completionProvider"];
+    assert!(
+        completion.is_object(),
+        "completionProvider should be an object: {completion}"
+    );
+    let triggers = completion["triggerCharacters"]
+        .as_array()
+        .expect("triggerCharacters should be array");
+    let trigger_strs: Vec<&str> = triggers.iter().map(|t| t.as_str().unwrap()).collect();
+    assert!(trigger_strs.contains(&"."), "should trigger on dot");
+
+    client.shutdown_and_exit().await;
+}
+
 // ───────────────────── diagnostics lifecycle ─────────────────────
 
 #[tokio::test]

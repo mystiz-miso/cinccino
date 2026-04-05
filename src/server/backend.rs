@@ -3,6 +3,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use super::completion;
 use super::document_symbol;
 use super::signature_help as sig_help;
 use super::DocumentStore;
@@ -82,6 +83,11 @@ impl LanguageServer for CinccinoBackend {
                         ..Default::default()
                     },
                 )),
+                completion_provider: Some(CompletionOptions {
+                    trigger_characters: Some(vec![".".to_string(), "\"".to_string()]),
+                    resolve_provider: Some(false),
+                    ..Default::default()
+                }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
@@ -278,7 +284,75 @@ impl LanguageServer for CinccinoBackend {
         ))
     }
 
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Convert LSP position to byte offset.
+        let offset = match position_to_byte_offset(&text, position) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        // Parse and build symbol table.
+        let file_path = uri.path();
+        let (ast, _) = parser::parse(&text);
+        let mut table = SymbolTable::new();
+        table.index_file(file_path, &ast);
+
+        let ctx = completion::detect_context(&text, offset, &ast, &table, file_path);
+        let items = completion::completions(&ctx, &table, file_path);
+
+        Ok(Some(CompletionResponse::Array(items)))
+    }
+
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<Value>> {
         Ok(None)
     }
+}
+
+/// Convert an LSP Position (line/character) to a byte offset in source text.
+///
+/// NOTE: LSP `character` is defined as a UTF-16 code unit offset, but this
+/// implementation treats it as a Unicode codepoint count (via `char_indices`).
+/// This matches the existing `position_to_offset` in `document.rs` and is
+/// correct for Circom sources which are ASCII-only. Supplementary-plane
+/// characters (outside BMP) would be handled incorrectly by both functions.
+fn position_to_byte_offset(source: &str, position: Position) -> Option<usize> {
+    let target_line = position.line as usize;
+    let target_col = position.character as usize;
+    let mut current_line = 0usize;
+
+    for (i, ch) in source.char_indices() {
+        if current_line == target_line {
+            // Found the target line start; advance by column.
+            let line_start = i;
+            for (col, (j, c)) in source[line_start..].char_indices().enumerate() {
+                if col == target_col {
+                    return Some(line_start + j);
+                }
+                if c == '\n' {
+                    break;
+                }
+            }
+            // Column past end of line or at end of source.
+            return Some(
+                (line_start
+                    + source[line_start..]
+                        .find('\n')
+                        .unwrap_or(source[line_start..].len()))
+                .min(source.len()),
+            );
+        }
+        if ch == '\n' {
+            current_line += 1;
+        }
+    }
+    // Line past end of source.
+    Some(source.len())
 }
