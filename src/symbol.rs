@@ -123,6 +123,20 @@ pub enum DiagnosticKind {
     DuplicateSymbol,
     /// A referenced symbol was not found.
     UndeclaredSymbol,
+    /// Assigning to an input signal inside a template body.
+    AssignToInput,
+    /// Using `=` (variable assign) on a signal.
+    VarAssignToSignal,
+    /// Using signal assign (`<==`, `<--`) on a variable.
+    SignalAssignToVar,
+    /// Template parameter count mismatch on component instantiation.
+    ParameterCountMismatch,
+    /// Constraint does not fit quadratic form (A * B + C = 0).
+    NonQuadraticConstraint,
+    /// `<--` assignment without a corresponding `===` constraint (warning).
+    UnsafeSignalAssignment,
+    /// Using signals inside a function body (signals only valid in templates).
+    SignalInFunction,
 }
 
 #[cfg(test)]

@@ -407,6 +407,19 @@ pub enum AnonCompInput {
     Named(Identifier, Expression),
 }
 
+impl Expression {
+    /// Extract the base identifier name from an expression,
+    /// following through indexing and member access.
+    pub fn extract_base_name(&self) -> Option<String> {
+        match self.kind.as_ref() {
+            ExpressionKind::Ident(name) => Some(name.clone()),
+            ExpressionKind::Index(base, _) => base.extract_base_name(),
+            ExpressionKind::Member(base, _) => base.extract_base_name(),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     Neg,    // -

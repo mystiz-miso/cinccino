@@ -1,4 +1,5 @@
 pub mod ast;
+pub mod constraint_checker;
 pub mod incremental;
 pub mod lexer;
 pub mod parser;
@@ -8,6 +9,7 @@ pub mod server;
 pub mod span;
 pub mod symbol;
 pub mod symbol_table;
+pub mod type_checker;
 pub mod visitor;
 pub mod walker;
 
