@@ -209,6 +209,20 @@ impl<'a> SymbolVisitor<'a> {
             match &stmt.kind {
                 StatementKind::VarDecl(v) => {
                     for entry in &v.names {
+                        // Check if the var init is a component instantiation
+                        if let Some(ref init) = entry.init {
+                            if let Some(name) = extract_call_name(init) {
+                                out.push(self.make_symbol(
+                                    &entry.name.name,
+                                    Some(format!("component {name}")),
+                                    SymbolKind::OBJECT,
+                                    entry.name.span,
+                                    entry.name.span,
+                                    Vec::new(),
+                                ));
+                                continue;
+                            }
+                        }
                         out.push(self.make_symbol(
                             &entry.name.name,
                             Some("var".to_string()),
@@ -220,7 +234,44 @@ impl<'a> SymbolVisitor<'a> {
                     }
                 }
                 StatementKind::SignalDecl(sig) => {
-                    self.collect_signal_decl_entries(sig, out);
+                    // Check each signal: if init is a component instantiation,
+                    // emit as component; otherwise emit as signal.
+                    for entry in &sig.names {
+                        if let Some((_, ref init_expr)) = entry.init {
+                            if let Some(name) = extract_call_name(init_expr) {
+                                out.push(self.make_symbol(
+                                    &entry.name.name,
+                                    Some(format!("component {name}")),
+                                    SymbolKind::OBJECT,
+                                    entry.name.span,
+                                    entry.name.span,
+                                    Vec::new(),
+                                ));
+                                continue;
+                            }
+                        }
+                        // Not a component — emit as signal
+                        let kind_str = match sig.kind {
+                            SignalKind::Input => "input",
+                            SignalKind::Output => "output",
+                            SignalKind::Intermediate => "intermediate",
+                        };
+                        let detail = if sig.tags.is_empty() {
+                            format!("signal {kind_str}")
+                        } else {
+                            let tags: Vec<&str> =
+                                sig.tags.iter().map(|t| t.name.as_str()).collect();
+                            format!("signal {kind_str} {{{}}}", tags.join(", "))
+                        };
+                        out.push(self.make_symbol(
+                            &entry.name.name,
+                            Some(detail),
+                            SymbolKind::FIELD,
+                            entry.name.span,
+                            entry.name.span,
+                            Vec::new(),
+                        ));
+                    }
                 }
                 StatementKind::ComponentDecl(c) => {
                     for entry in &c.names {
@@ -252,6 +303,34 @@ impl<'a> SymbolVisitor<'a> {
                         Vec::new(),
                     ));
                 }
+                // Detect component instantiation in assignment statements:
+                // `comp = TemplateName(args)` or `comp[i] = TemplateName(args)`
+                StatementKind::Assignment(assign) => {
+                    if let Some(name) = extract_call_name(&assign.rhs) {
+                        let lhs_name = extract_lhs_name(&assign.lhs);
+                        out.push(self.make_symbol(
+                            &lhs_name,
+                            Some(format!("component {name}")),
+                            SymbolKind::OBJECT,
+                            stmt.span,
+                            stmt.span,
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // Recurse into control flow blocks to find nested assignments
+                StatementKind::For(f) => {
+                    self.collect_block_declarations(&f.body, out);
+                }
+                StatementKind::While(w) => {
+                    self.collect_block_declarations(&w.body, out);
+                }
+                StatementKind::IfElse(ie) => {
+                    self.collect_block_declarations(&ie.then_body, out);
+                    if let Some(ref else_body) = ie.else_body {
+                        self.collect_block_declarations(else_body, out);
+                    }
+                }
                 _ => {}
             }
         }
@@ -282,10 +361,28 @@ impl<'a> SymbolVisitor<'a> {
     }
 }
 
-/// Try to extract a function/template name from a call expression.
+/// Extract the base name from an LHS expression (stripping array indices and member access).
+fn extract_lhs_name(expr: &Expression) -> String {
+    match expr.kind.as_ref() {
+        ExpressionKind::Ident(name) => name.clone(),
+        ExpressionKind::Index(base, _) => extract_lhs_name(base),
+        ExpressionKind::Member(base, field) => {
+            format!("{}.{}", extract_lhs_name(base), field.name)
+        }
+        _ => "<component>".to_string(),
+    }
+}
+
+/// Try to extract a function/template name from a call or anonymous component expression.
 fn extract_call_name(expr: &Expression) -> Option<&str> {
     match expr.kind.as_ref() {
         ExpressionKind::Call(callee, _) => match callee.kind.as_ref() {
+            ExpressionKind::Ident(name) => Some(name),
+            _ => None,
+        },
+        // Anonymous component: Template(params)(inputs) — the outer "call" has
+        // a Call as callee: Call(Call(Ident("Template"), params), inputs)
+        ExpressionKind::AnonymousComp(anon) => match anon.template.kind.as_ref() {
             ExpressionKind::Ident(name) => Some(name),
             _ => None,
         },
@@ -511,5 +608,74 @@ mod tests {
         "#,
         );
         assert!(symbols.is_empty());
+    }
+
+    #[test]
+    fn component_assignment_in_loop() {
+        let symbols = symbols_for(
+            r#"
+            template Circuit(n) {
+                signal input in;
+                signal output out;
+                component mux[n];
+                for (var i = 0; i < n; i++) {
+                    mux[i] = MultiMux1(2);
+                }
+                out <== in;
+            }
+        "#,
+        );
+
+        let circuit = &symbols[0];
+        let children = circuit.children.as_ref().unwrap();
+
+        // Find all OBJECT children (component decl + assignment)
+        let components: Vec<&DocumentSymbol> = children
+            .iter()
+            .filter(|c| c.kind == SymbolKind::OBJECT)
+            .collect();
+
+        // Should have the declaration (mux) AND the assignment (mux from loop)
+        assert!(
+            components.len() >= 2,
+            "expected at least 2 component symbols, got {}",
+            components.len()
+        );
+
+        // The loop assignment should have detail "component MultiMux1"
+        let has_mux1 = components
+            .iter()
+            .any(|c| c.detail.as_deref() == Some("component MultiMux1"));
+        assert!(
+            has_mux1,
+            "expected a component with detail 'component MultiMux1'"
+        );
+    }
+
+    #[test]
+    fn component_assignment_in_if() {
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                signal input sel;
+                component h;
+                if (sel == 1) {
+                    h = Poseidon(2);
+                }
+            }
+        "#,
+        );
+
+        let t = &symbols[0];
+        let children = t.children.as_ref().unwrap();
+        let components: Vec<&DocumentSymbol> = children
+            .iter()
+            .filter(|c| c.kind == SymbolKind::OBJECT)
+            .collect();
+
+        let has_poseidon = components
+            .iter()
+            .any(|c| c.detail.as_deref() == Some("component Poseidon"));
+        assert!(has_poseidon, "expected component Poseidon from if body");
     }
 }
