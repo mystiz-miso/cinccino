@@ -10,7 +10,8 @@
 //! - Incremental updates (re-parse one file without affecting others)
 //! - Duplicate and undeclared symbol detection
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::Path;
 
 use crate::ast::*;
 use crate::scope::ScopeTree;
@@ -125,7 +126,8 @@ impl SymbolTable {
             .map(|(_, ids)| &self.symbols[ids[0].0 as usize])
     }
 
-    /// Look up a simple name from a given scope, also searching included files.
+    /// Look up a simple name from a given scope, also searching included
+    /// files transitively (BFS over the include graph).
     pub fn lookup_with_includes(
         &self,
         scope: ScopeId,
@@ -137,16 +139,31 @@ impl SymbolTable {
             return Some(sym);
         }
 
-        // Then try included files' file-level scopes.
-        // TODO: transitive includes — currently only direct includes are
-        // searched. In Circom, if A includes B and B includes C, symbols
-        // from C should be visible in A. This needs a BFS/DFS over the
-        // include graph.
+        // BFS over the include graph to find the symbol in transitive
+        // includes. Track visited files to handle cycles.
+        let mut visited = HashSet::new();
+        visited.insert(file_path.to_string());
+        let mut queue = VecDeque::new();
+
         if let Some(includes) = self.includes.get(file_path) {
             for inc_path in includes {
-                if let Some(entry) = self.file_scopes.get(inc_path) {
-                    if let Some(ids) = self.scopes.lookup_local(entry.root_scope, name) {
-                        return Some(&self.symbols[ids[0].0 as usize]);
+                if visited.insert(inc_path.clone()) {
+                    queue.push_back(inc_path.clone());
+                }
+            }
+        }
+
+        while let Some(current) = queue.pop_front() {
+            if let Some(entry) = self.file_scopes.get(&current) {
+                if let Some(ids) = self.scopes.lookup_local(entry.root_scope, name) {
+                    return Some(&self.symbols[ids[0].0 as usize]);
+                }
+            }
+            // Enqueue transitive includes.
+            if let Some(includes) = self.includes.get(&current) {
+                for inc_path in includes {
+                    if visited.insert(inc_path.clone()) {
+                        queue.push_back(inc_path.clone());
                     }
                 }
             }
@@ -193,6 +210,183 @@ impl SymbolTable {
         }
 
         Some(current)
+    }
+
+    /// Resolve an include path relative to the including file's directory.
+    /// Also searches library directories if configured.
+    pub fn resolve_include_path(
+        &self,
+        include_path: &str,
+        from_file: &str,
+        lib_dirs: &[String],
+    ) -> Option<String> {
+        let from_dir = Path::new(from_file).parent().unwrap_or(Path::new(""));
+
+        // Try relative to the including file's directory.
+        let candidate = from_dir.join(include_path);
+        if candidate.exists() {
+            if let Ok(canonical) = candidate.canonicalize() {
+                return Some(canonical.to_string_lossy().into_owned());
+            }
+        }
+
+        // Try each library directory.
+        for dir in lib_dirs {
+            let candidate = Path::new(dir).join(include_path);
+            if candidate.exists() {
+                if let Ok(canonical) = candidate.canonicalize() {
+                    return Some(canonical.to_string_lossy().into_owned());
+                }
+            }
+        }
+
+        None
+    }
+
+    /// Get the full transitive include closure for a file (BFS).
+    pub fn transitive_includes(&self, file_path: &str) -> Vec<&str> {
+        let mut visited = HashSet::new();
+        visited.insert(file_path);
+        let mut queue = VecDeque::new();
+        let mut result = Vec::new();
+
+        if let Some(includes) = self.includes.get(file_path) {
+            for inc in includes {
+                if visited.insert(inc.as_str()) {
+                    queue.push_back(inc.as_str());
+                }
+            }
+        }
+
+        while let Some(current) = queue.pop_front() {
+            result.push(current);
+            if let Some(includes) = self.includes.get(current) {
+                for inc in includes {
+                    if visited.insert(inc.as_str()) {
+                        queue.push_back(inc.as_str());
+                    }
+                }
+            }
+        }
+
+        result
+    }
+
+    /// Detect circular includes. Returns the cycle path if found.
+    pub fn detect_circular_includes(&self) -> Option<Vec<String>> {
+        // DFS with path tracking on each file.
+        for start in self.includes.keys() {
+            let mut visited = HashSet::new();
+            let mut path = Vec::new();
+            if let Some(cycle) = self.dfs_find_cycle(start, &mut visited, &mut path) {
+                return Some(cycle);
+            }
+        }
+        None
+    }
+
+    /// DFS helper for cycle detection.
+    fn dfs_find_cycle(
+        &self,
+        node: &str,
+        visiting: &mut HashSet<String>,
+        path: &mut Vec<String>,
+    ) -> Option<Vec<String>> {
+        if !visiting.insert(node.to_string()) {
+            // Found a cycle — extract it from the path.
+            if let Some(pos) = path.iter().position(|p| p == node) {
+                let mut cycle: Vec<String> = path[pos..].to_vec();
+                cycle.push(node.to_string());
+                return Some(cycle);
+            }
+            return None;
+        }
+
+        path.push(node.to_string());
+
+        if let Some(includes) = self.includes.get(node) {
+            for inc in includes {
+                if let Some(cycle) = self.dfs_find_cycle(inc, visiting, path) {
+                    return Some(cycle);
+                }
+            }
+        }
+
+        path.pop();
+        visiting.remove(node);
+        None
+    }
+
+    /// Get files that include the given file (reverse lookup).
+    pub fn included_by(&self, file_path: &str) -> Vec<&str> {
+        self.includes
+            .iter()
+            .filter_map(|(from, includes)| {
+                if includes.iter().any(|inc| inc == file_path) {
+                    Some(from.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Get topological ordering of all files (for incremental
+    /// re-analysis). Returns files in dependency order: a file
+    /// appears after all files it includes. Returns `None` if there
+    /// is a cycle.
+    pub fn topological_order(&self) -> Option<Vec<&str>> {
+        // Collect all known files.
+        let mut all_files: HashSet<&str> = HashSet::new();
+        for (file, includes) in &self.includes {
+            all_files.insert(file.as_str());
+            for inc in includes {
+                all_files.insert(inc.as_str());
+            }
+        }
+        for file in self.file_scopes.keys() {
+            all_files.insert(file.as_str());
+        }
+
+        // Kahn's algorithm. Edge: A includes B means B is a dependency
+        // of A. We want B before A, so in-degree counts how many files
+        // a file depends on (i.e. how many files it includes).
+        let mut in_degree: HashMap<&str, usize> = HashMap::new();
+        for &file in &all_files {
+            in_degree.insert(file, 0);
+        }
+        for (includer, includes) in &self.includes {
+            // Each include is a dependency edge includer -> included.
+            // In-degree of the includer increases per dependency.
+            *in_degree.entry(includer.as_str()).or_insert(0) += includes.len();
+        }
+
+        let mut queue: VecDeque<&str> = in_degree
+            .iter()
+            .filter(|(_, &deg)| deg == 0)
+            .map(|(&file, _)| file)
+            .collect();
+
+        let mut result = Vec::new();
+        while let Some(file) = queue.pop_front() {
+            result.push(file);
+            // For each file that includes `file`, decrement in-degree.
+            for (includer, includes) in &self.includes {
+                if includes.iter().any(|inc| inc.as_str() == file) {
+                    let deg = in_degree.get_mut(includer.as_str()).unwrap();
+                    *deg -= 1;
+                    if *deg == 0 {
+                        queue.push_back(includer.as_str());
+                    }
+                }
+            }
+        }
+
+        if result.len() == all_files.len() {
+            Some(result)
+        } else {
+            None // cycle detected
+        }
     }
 
     /// Get the file-level scope for a file.
@@ -1473,5 +1667,298 @@ mod tests {
             }
             _ => panic!("expected signal"),
         }
+    }
+
+    // ── Transitive include resolution ──────────────────────────────
+
+    #[test]
+    fn transitive_include_resolution() {
+        let mut table = SymbolTable::new();
+
+        // C defines a template.
+        let (ast_c, _) = parser::parse(r#"template Leaf() { signal input x; }"#);
+        table.index_file("c.circom", &ast_c);
+
+        // B includes C.
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "c.circom";
+            template Middle() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        // A includes B (but not C directly).
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template Top() { signal input z; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let scope_a = table.file_scope("a.circom").unwrap();
+
+        // A can see B's symbols (direct include).
+        let middle = table
+            .lookup_with_includes(scope_a, "Middle", "a.circom")
+            .unwrap();
+        assert_eq!(middle.name, "Middle");
+
+        // A can see C's symbols (transitive include via B).
+        let leaf = table
+            .lookup_with_includes(scope_a, "Leaf", "a.circom")
+            .unwrap();
+        assert_eq!(leaf.name, "Leaf");
+    }
+
+    #[test]
+    fn circular_include_detection() {
+        let mut table = SymbolTable::new();
+
+        // A includes B.
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input x; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        // B includes A.
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "a.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let cycle = table.detect_circular_includes();
+        assert!(cycle.is_some(), "expected circular include");
+        let cycle = cycle.unwrap();
+        // Cycle should contain both files.
+        assert!(cycle.contains(&"a.circom".to_string()));
+        assert!(cycle.contains(&"b.circom".to_string()));
+    }
+
+    #[test]
+    fn no_cycle_in_acyclic_graph() {
+        let mut table = SymbolTable::new();
+
+        let (ast_c, _) = parser::parse(r#"template C() { signal input x; }"#);
+        table.index_file("c.circom", &ast_c);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "c.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input z; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        assert!(table.detect_circular_includes().is_none());
+    }
+
+    #[test]
+    fn diamond_dependency() {
+        let mut table = SymbolTable::new();
+
+        // D is at the bottom.
+        let (ast_d, _) = parser::parse(r#"template D() { signal input w; }"#);
+        table.index_file("d.circom", &ast_d);
+
+        // B and C both include D.
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "d.circom";
+            template B() { signal input x; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let (ast_c, _) = parser::parse(
+            r#"
+            include "d.circom";
+            template C() { signal input y; }
+            "#,
+        );
+        table.index_file("c.circom", &ast_c);
+
+        // A includes both B and C.
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            include "c.circom";
+            template A() { signal input z; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let scope_a = table.file_scope("a.circom").unwrap();
+
+        // A can see D's symbol through both B and C.
+        let d = table
+            .lookup_with_includes(scope_a, "D", "a.circom")
+            .unwrap();
+        assert_eq!(d.name, "D");
+
+        // No circular dependency in a diamond.
+        assert!(table.detect_circular_includes().is_none());
+    }
+
+    #[test]
+    fn transitive_includes_closure() {
+        let mut table = SymbolTable::new();
+
+        let (ast_c, _) = parser::parse(r#"template C() { signal input x; }"#);
+        table.index_file("c.circom", &ast_c);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "c.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input z; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let closure = table.transitive_includes("a.circom");
+        assert!(closure.contains(&"b.circom"));
+        assert!(closure.contains(&"c.circom"));
+        assert_eq!(closure.len(), 2);
+    }
+
+    #[test]
+    fn included_by_reverse_lookup() {
+        let mut table = SymbolTable::new();
+
+        let (ast_lib, _) = parser::parse(r#"template Lib() { signal input x; }"#);
+        table.index_file("lib.circom", &ast_lib);
+
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "lib.circom";
+            template A() { signal input y; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "lib.circom";
+            template B() { signal input z; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let mut dependents = table.included_by("lib.circom");
+        dependents.sort();
+        assert_eq!(dependents, vec!["a.circom", "b.circom"]);
+    }
+
+    #[test]
+    fn topological_order_acyclic() {
+        let mut table = SymbolTable::new();
+
+        let (ast_c, _) = parser::parse(r#"template C() { signal input x; }"#);
+        table.index_file("c.circom", &ast_c);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "c.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input z; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let order = table.topological_order().unwrap();
+        // c should come before b, and b before a.
+        let pos_c = order.iter().position(|&f| f == "c.circom").unwrap();
+        let pos_b = order.iter().position(|&f| f == "b.circom").unwrap();
+        let pos_a = order.iter().position(|&f| f == "a.circom").unwrap();
+        assert!(pos_c < pos_b);
+        assert!(pos_b < pos_a);
+    }
+
+    #[test]
+    fn topological_order_returns_none_on_cycle() {
+        let mut table = SymbolTable::new();
+
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input x; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "a.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        assert!(table.topological_order().is_none());
+    }
+
+    #[test]
+    fn transitive_lookup_does_not_loop_on_cycle() {
+        let mut table = SymbolTable::new();
+
+        // A includes B, B includes A — circular.
+        let (ast_a, _) = parser::parse(
+            r#"
+            include "b.circom";
+            template A() { signal input x; }
+            "#,
+        );
+        table.index_file("a.circom", &ast_a);
+
+        let (ast_b, _) = parser::parse(
+            r#"
+            include "a.circom";
+            template B() { signal input y; }
+            "#,
+        );
+        table.index_file("b.circom", &ast_b);
+
+        let scope_a = table.file_scope("a.circom").unwrap();
+
+        // Should still resolve B (direct include).
+        let b = table
+            .lookup_with_includes(scope_a, "B", "a.circom")
+            .unwrap();
+        assert_eq!(b.name, "B");
+
+        // Should not hang looking for a nonexistent symbol.
+        assert!(table
+            .lookup_with_includes(scope_a, "Nonexistent", "a.circom")
+            .is_none());
     }
 }
