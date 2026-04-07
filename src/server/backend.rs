@@ -8,7 +8,7 @@ use super::document_symbol;
 use super::signature_help as sig_help;
 use super::DocumentStore;
 use crate::parser;
-use crate::span::LineIndex;
+use crate::span::{LineCol, LineIndex};
 use crate::symbol_table::SymbolTable;
 
 use crate::parser::ParseError;
@@ -88,6 +88,7 @@ impl LanguageServer for CinccinoBackend {
                     resolve_provider: Some(false),
                     ..Default::default()
                 }),
+                definition_provider: Some(OneOf::Left(true)),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 signature_help_provider: Some(SignatureHelpOptions {
                     trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
@@ -241,6 +242,87 @@ impl LanguageServer for CinccinoBackend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        // Convert LSP position to byte offset
+        let offset = match position_to_byte_offset(&text, position) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        let word = word_at_offset(&text, offset);
+        if word.is_empty() {
+            return Ok(None);
+        }
+
+        // Parse and build symbol table
+        let (ast, _) = parser::parse(&text);
+        let mut symbol_table = SymbolTable::new();
+        let file_path = uri.as_str();
+        symbol_table.index_file(file_path, &ast);
+
+        // Also index all other open documents for cross-file resolution
+        for (doc_uri, doc_text) in self.documents.all_documents() {
+            if doc_uri != uri {
+                let doc_path = doc_uri.as_str();
+                let (doc_ast, _) = parser::parse(&doc_text);
+                symbol_table.index_file(doc_path, &doc_ast);
+            }
+        }
+
+        // Look up the symbol using the file's root scope
+        let scope = symbol_table
+            .file_scope(file_path)
+            .unwrap_or(crate::symbol::ScopeId(0));
+
+        if let Some(symbol) = symbol_table.lookup_with_includes(scope, &word, file_path) {
+            let target_uri = Url::parse(&symbol.file).unwrap_or_else(|_| uri.clone());
+
+            // For cross-file symbols we need the target file's text
+            let target_text = if symbol.file == file_path {
+                text.clone()
+            } else {
+                self.documents
+                    .get_text(&target_uri)
+                    .unwrap_or_else(|| text.clone())
+            };
+            let target_line_index = LineIndex::new(&target_text);
+
+            let start = target_line_index
+                .line_col(symbol.span.start)
+                .unwrap_or(LineCol { line: 0, col: 0 });
+            let end = target_line_index.line_col(symbol.span.end).unwrap_or(start);
+
+            let range = Range {
+                start: Position {
+                    line: start.line,
+                    character: start.col,
+                },
+                end: Position {
+                    line: end.line,
+                    character: end.col,
+                },
+            };
+
+            return Ok(Some(GotoDefinitionResponse::Scalar(Location {
+                uri: target_uri,
+                range,
+            })));
+        }
+
+        Ok(None)
+    }
+
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
@@ -355,4 +437,35 @@ fn position_to_byte_offset(source: &str, position: Position) -> Option<usize> {
     }
     // Line past end of source.
     Some(source.len())
+}
+
+/// Extract the word (identifier) at a given byte offset in source text.
+///
+/// A "word" is a contiguous run of alphanumeric characters or underscores.
+/// Returns an empty string if the offset is not within a word.
+fn word_at_offset(source: &str, offset: usize) -> String {
+    let bytes = source.as_bytes();
+    if offset >= bytes.len() {
+        return String::new();
+    }
+
+    fn is_ident(b: u8) -> bool {
+        b.is_ascii_alphanumeric() || b == b'_'
+    }
+
+    if !is_ident(bytes[offset]) {
+        return String::new();
+    }
+
+    let mut start = offset;
+    while start > 0 && is_ident(bytes[start - 1]) {
+        start -= 1;
+    }
+
+    let mut end = offset;
+    while end < bytes.len() && is_ident(bytes[end]) {
+        end += 1;
+    }
+
+    source[start..end].to_string()
 }

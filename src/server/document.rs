@@ -115,6 +115,14 @@ impl DocumentStore {
         self.documents.contains_key(uri)
     }
 
+    /// Get all open documents as (uri, text) pairs.
+    pub fn all_documents(&self) -> Vec<(Url, String)> {
+        self.documents
+            .iter()
+            .map(|entry| (entry.key().clone(), entry.value().cached_text.clone()))
+            .collect()
+    }
+
     /// Get the cached parse errors for a document.
     pub fn get_parse_errors(&self, uri: &Url) -> Option<(String, Vec<crate::parser::ParseError>)> {
         self.documents.get(uri).map(|doc| {
