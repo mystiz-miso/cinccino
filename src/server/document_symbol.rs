@@ -317,6 +317,70 @@ impl<'a> SymbolVisitor<'a> {
                             Vec::new(),
                         ));
                     }
+                    // Also extract nested calls from the RHS
+                    let mut calls = Vec::new();
+                    extract_all_call_names(&assign.rhs, &mut calls);
+                    // Skip the first one if it was already emitted above
+                    let top_name = extract_call_name(&assign.rhs);
+                    for name in calls {
+                        if top_name == Some(name) {
+                            continue;
+                        }
+                        out.push(self.make_symbol(
+                            name,
+                            Some(format!("component {name}")),
+                            SymbolKind::OBJECT,
+                            stmt.span,
+                            stmt.span,
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // Tuple assignment: `(a, b) <== Template(args)(inputs)`
+                StatementKind::TupleAssign(ta) => {
+                    let mut calls = Vec::new();
+                    extract_all_call_names(&ta.rhs, &mut calls);
+                    for name in calls {
+                        out.push(self.make_symbol(
+                            name,
+                            Some(format!("component {name}")),
+                            SymbolKind::OBJECT,
+                            stmt.span,
+                            stmt.span,
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // Constraint equality: `expr === expr`
+                StatementKind::ConstraintEq(ceq) => {
+                    let mut calls = Vec::new();
+                    extract_all_call_names(&ceq.lhs, &mut calls);
+                    extract_all_call_names(&ceq.rhs, &mut calls);
+                    for name in calls {
+                        out.push(self.make_symbol(
+                            name,
+                            Some(format!("component {name}")),
+                            SymbolKind::OBJECT,
+                            stmt.span,
+                            stmt.span,
+                            Vec::new(),
+                        ));
+                    }
+                }
+                // Bare expression statement: `Must()(IsNonZero()(x));`
+                StatementKind::Expression(expr) => {
+                    let mut calls = Vec::new();
+                    extract_all_call_names(expr, &mut calls);
+                    for name in calls {
+                        out.push(self.make_symbol(
+                            name,
+                            Some(format!("component {name}")),
+                            SymbolKind::OBJECT,
+                            stmt.span,
+                            stmt.span,
+                            Vec::new(),
+                        ));
+                    }
                 }
                 // Recurse into control flow blocks to find nested assignments
                 StatementKind::For(f) => {
@@ -387,6 +451,62 @@ fn extract_call_name(expr: &Expression) -> Option<&str> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+/// Recursively extract ALL call/anonymous-component names from an expression tree.
+/// This catches nested calls like `Must()(IsNonZero()(x))`.
+fn extract_all_call_names<'a>(expr: &'a Expression, out: &mut Vec<&'a str>) {
+    match expr.kind.as_ref() {
+        ExpressionKind::Call(callee, args) => {
+            if let ExpressionKind::Ident(name) = callee.kind.as_ref() {
+                out.push(name);
+            }
+            extract_all_call_names(callee, out);
+            for arg in args {
+                extract_all_call_names(arg, out);
+            }
+        }
+        ExpressionKind::AnonymousComp(anon) => {
+            if let ExpressionKind::Ident(name) = anon.template.kind.as_ref() {
+                out.push(name);
+            }
+            extract_all_call_names(&anon.template, out);
+            for input in &anon.inputs {
+                match input {
+                    AnonCompInput::Positional(e) => extract_all_call_names(e, out),
+                    AnonCompInput::Named(_, e) => extract_all_call_names(e, out),
+                }
+            }
+            for arg in &anon.template_args {
+                extract_all_call_names(arg, out);
+            }
+        }
+        ExpressionKind::Binary(lhs, _, rhs) => {
+            extract_all_call_names(lhs, out);
+            extract_all_call_names(rhs, out);
+        }
+        ExpressionKind::Unary(_, inner) => {
+            extract_all_call_names(inner, out);
+        }
+        ExpressionKind::Ternary(cond, then_e, else_e) => {
+            extract_all_call_names(cond, out);
+            extract_all_call_names(then_e, out);
+            extract_all_call_names(else_e, out);
+        }
+        ExpressionKind::Index(arr, idx) => {
+            extract_all_call_names(arr, out);
+            extract_all_call_names(idx, out);
+        }
+        ExpressionKind::Member(base, _) => {
+            extract_all_call_names(base, out);
+        }
+        ExpressionKind::ArrayLit(elems) => {
+            for e in elems {
+                extract_all_call_names(e, out);
+            }
+        }
+        _ => {}
     }
 }
 
