@@ -235,8 +235,13 @@ impl<'a> SymbolVisitor<'a> {
                 }
                 StatementKind::SignalDecl(sig) => {
                     // Check each signal: if init is a component instantiation,
-                    // emit as component; otherwise emit as signal.
+                    // emit as component; otherwise emit as signal. Either way,
+                    // walk the init for any *nested* calls (#259) so patterns
+                    // like `signal x <== Outer()(Inner()(in));` emit BOTH
+                    // `Outer` and `Inner` as call edges. Mirrors the
+                    // Assignment arm below.
                     for entry in &sig.names {
+                        let mut emitted_top: Option<&str> = None;
                         if let Some((_, ref init_expr)) = entry.init {
                             if let Some(name) = extract_call_name(init_expr) {
                                 out.push(self.make_symbol(
@@ -247,6 +252,28 @@ impl<'a> SymbolVisitor<'a> {
                                     entry.name.span,
                                     Vec::new(),
                                 ));
+                                emitted_top = Some(name);
+                            }
+                            // Always walk nested calls — covers both the
+                            // outer-is-a-call case (skip the duplicate via
+                            // emitted_top) and the outer-is-not-a-call case
+                            // (e.g. `signal x <== a + Foo()(in);`).
+                            let mut nested = Vec::new();
+                            extract_all_call_names(init_expr, &mut nested);
+                            for nested_name in nested {
+                                if emitted_top == Some(nested_name) {
+                                    continue;
+                                }
+                                out.push(self.make_symbol(
+                                    nested_name,
+                                    Some(format!("component {nested_name}")),
+                                    SymbolKind::OBJECT,
+                                    stmt.span,
+                                    stmt.span,
+                                    Vec::new(),
+                                ));
+                            }
+                            if emitted_top.is_some() {
                                 continue;
                             }
                         }
@@ -797,5 +824,98 @@ mod tests {
             .iter()
             .any(|c| c.detail.as_deref() == Some("component Poseidon"));
         assert!(has_poseidon, "expected component Poseidon from if body");
+    }
+
+    #[test]
+    fn signal_decl_with_nested_anon_comp() {
+        // Regression for #259: a `signal output` initialised by a chained
+        // anonymous component instantiation used to only emit the OUTER
+        // template name. The inner one was silently dropped, so the
+        // call-graph lost edges like `IsNonZero -> IsZero`.
+        let symbols = symbols_for(
+            r#"
+            template IsNonZero() {
+                signal input in;
+                signal output out <== NOT()(IsZero()(in));
+            }
+        "#,
+        );
+
+        let t = &symbols[0];
+        let children = t.children.as_ref().unwrap();
+        let comp_details: Vec<&str> = children
+            .iter()
+            .filter(|c| c.kind == SymbolKind::OBJECT)
+            .filter_map(|c| c.detail.as_deref())
+            .collect();
+
+        assert!(
+            comp_details.contains(&"component NOT"),
+            "expected outer NOT call, got {comp_details:?}"
+        );
+        assert!(
+            comp_details.contains(&"component IsZero"),
+            "expected nested IsZero call, got {comp_details:?}"
+        );
+    }
+
+    #[test]
+    fn signal_decl_with_intermediate_signal_init() {
+        // Intermediate signal (no `input`/`output` keyword) initialised
+        // with the same chained-call shape — same fix should apply.
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                signal input in;
+                signal mid <== Wrap()(Inner()(in));
+            }
+        "#,
+        );
+        let comp_details: Vec<&str> = symbols[0]
+            .children
+            .as_ref()
+            .unwrap()
+            .iter()
+            .filter(|c| c.kind == SymbolKind::OBJECT)
+            .filter_map(|c| c.detail.as_deref())
+            .collect();
+        assert!(comp_details.contains(&"component Wrap"));
+        assert!(comp_details.contains(&"component Inner"));
+    }
+
+    #[test]
+    fn signal_decl_with_call_inside_binary_init() {
+        // Edge case: the init's *outer* expression isn't a call at all,
+        // but a binary/arithmetic node that contains a call deeper in.
+        // The walk should still surface `Foo` even though the signal
+        // itself is emitted as a plain FIELD (not a component).
+        let symbols = symbols_for(
+            r#"
+            template T() {
+                signal input a;
+                signal x <== a + Foo()(a);
+            }
+        "#,
+        );
+        let children = symbols[0].children.as_ref().unwrap();
+
+        // Foo should appear as an OBJECT child.
+        let comp_details: Vec<&str> = children
+            .iter()
+            .filter(|c| c.kind == SymbolKind::OBJECT)
+            .filter_map(|c| c.detail.as_deref())
+            .collect();
+        assert!(
+            comp_details.contains(&"component Foo"),
+            "expected nested Foo even though outer init is binary, got {comp_details:?}"
+        );
+
+        // x should still be emitted as a signal FIELD, not a component.
+        let x = children
+            .iter()
+            .find(|c| c.name == "x")
+            .expect("expected signal x to be emitted");
+        assert_eq!(x.kind, SymbolKind::FIELD);
+        assert_eq!(x.detail.as_deref(), Some("signal intermediate"));
     }
 }
