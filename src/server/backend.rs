@@ -298,6 +298,7 @@ impl LanguageServer for CinccinoBackend {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
@@ -314,6 +315,11 @@ impl LanguageServer for CinccinoBackend {
         Ok(Some(DocumentSymbolResponse::Nested(symbols)))
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
     async fn goto_definition(
         &self,
         params: GotoDefinitionParams,
@@ -370,6 +376,11 @@ impl LanguageServer for CinccinoBackend {
         Ok(None)
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
@@ -407,6 +418,11 @@ impl LanguageServer for CinccinoBackend {
         Ok(hover::hover_info(&symbol_table, scope, &word, file_path))
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri),
+    )]
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -460,6 +476,11 @@ impl LanguageServer for CinccinoBackend {
         }
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
@@ -503,6 +524,11 @@ impl LanguageServer for CinccinoBackend {
         ))
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri),
+    )]
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -534,6 +560,11 @@ impl LanguageServer for CinccinoBackend {
         Ok(None)
     }
 
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position.text_document.uri),
+    )]
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
@@ -589,6 +620,7 @@ impl LanguageServer for CinccinoBackend {
         Ok(Some(edit))
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let text = match self.documents.get_text(&uri) {
@@ -604,6 +636,7 @@ impl LanguageServer for CinccinoBackend {
         }
     }
 
+    #[tracing::instrument(level = "debug", skip_all, fields(uri = %params.text_document.uri))]
     async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
         let uri = params.text_document.uri;
         let text = match self.documents.get_text(&uri) {
