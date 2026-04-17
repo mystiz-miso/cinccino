@@ -203,6 +203,17 @@ impl SymbolTable {
                 }
                 SymbolKind::Template(t) => t.body_scope,
                 SymbolKind::Bus(b) => b.body_scope,
+                // A bus-typed signal (`signal input Point() p`) lets the
+                // caller drill into the bus's fields via dot notation:
+                // `p.x` resolves through the bus's body scope.
+                SymbolKind::Signal(sig) => {
+                    let bus_name = sig.bus_type.as_ref()?;
+                    let bus = self.lookup_with_includes(scope, bus_name, file_path)?;
+                    match &bus.kind {
+                        SymbolKind::Bus(b) => b.body_scope,
+                        _ => return None,
+                    }
+                }
                 _ => return None,
             };
             let ids = self.scopes.lookup_local(body_scope, part)?;

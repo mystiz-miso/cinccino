@@ -60,6 +60,7 @@ fn kind_name(kind: DiagnosticKind) -> &'static str {
         DiagnosticKind::UnusedComponentOutput => "UnusedComponentOutput",
         DiagnosticKind::MissingComponentInput => "MissingComponentInput",
         DiagnosticKind::UnderconstrainedOutput => "UnderconstrainedOutput",
+        DiagnosticKind::BusTypeMismatch => "BusTypeMismatch",
     }
 }
 

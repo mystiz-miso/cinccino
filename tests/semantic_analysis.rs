@@ -696,6 +696,170 @@ fn symbol_table_remove_file_drops_symbols() {
 
 // ─── symbol_table: qualified resolution ────────────────────────────────
 
+// ─── bus type system (#46) ─────────────────────────────────────────────
+
+#[test]
+fn bus_definition_is_indexed() {
+    let table = index(
+        r#"
+        pragma circom 2.2.0;
+        bus Point(n) {
+            signal x[n];
+            signal y;
+        }
+        "#,
+    );
+    let scope = table.file_scope("main.circom").unwrap();
+    let sym = table.lookup(scope, "Point").unwrap();
+    match &sym.kind {
+        SymbolKind::Bus(b) => {
+            assert_eq!(b.params, vec!["n".to_string()]);
+            // The bus body scope must expose `x` and `y`.
+            assert!(table.scopes.lookup_local(b.body_scope, "x").is_some());
+            assert!(table.scopes.lookup_local(b.body_scope, "y").is_some());
+        }
+        _ => panic!("expected bus symbol"),
+    }
+}
+
+#[test]
+fn nested_bus_field_is_resolvable_via_qualified_lookup() {
+    let table = index(
+        r#"
+        pragma circom 2.2.0;
+        bus Point() {
+            signal x;
+            signal y;
+        }
+        bus Line() {
+            Point() start;
+            Point() end;
+        }
+        template T() {
+            signal input Line() l;
+            signal output Point() head;
+            head <== l.start;
+        }
+        "#,
+    );
+    let scope = table.file_scope("main.circom").unwrap();
+    let line = table.lookup(scope, "Line").unwrap();
+    let line_scope = match &line.kind {
+        SymbolKind::Bus(b) => b.body_scope,
+        _ => panic!("expected bus"),
+    };
+    // `Line.start` should resolve to a signal with bus_type=Point.
+    let start = table.lookup(line_scope, "start").unwrap();
+    match &start.kind {
+        SymbolKind::Signal(s) => {
+            assert_eq!(s.bus_type.as_deref(), Some("Point"));
+        }
+        _ => panic!("expected signal"),
+    }
+}
+
+#[test]
+fn bus_signal_dot_access_through_qualified_resolution() {
+    let table = index(
+        r#"
+        pragma circom 2.2.0;
+        bus Point() {
+            signal x;
+            signal y;
+        }
+        template T() {
+            signal input Point() p;
+            signal output o;
+            o <== p.x;
+        }
+        "#,
+    );
+    let scope = table.file_scope("main.circom").unwrap();
+    let t = table.lookup(scope, "T").unwrap();
+    let body = match &t.kind {
+        SymbolKind::Template(t) => t.body_scope,
+        _ => panic!("expected template"),
+    };
+    // Resolving [p, x] from the template body scope should yield `x`.
+    let resolved = table
+        .resolve_qualified(body, &["p", "x"], "main.circom")
+        .unwrap();
+    assert_eq!(resolved.name, "x");
+}
+
+#[test]
+fn bus_type_mismatch_is_diagnosed() {
+    let diags = types_of(
+        r#"
+        pragma circom 2.2.0;
+        bus A() { signal v; }
+        bus B() { signal v; }
+        template T() {
+            signal input A() a;
+            signal output B() b;
+            b <== a;
+        }
+        "#,
+    );
+    assert_eq!(kind_count(&diags, DiagnosticKind::BusTypeMismatch), 1);
+}
+
+#[test]
+fn matching_bus_types_pass_typecheck() {
+    let diags = types_of(
+        r#"
+        pragma circom 2.2.0;
+        bus Point() { signal x; signal y; }
+        template Src() {
+            signal output Point() p;
+        }
+        template T() {
+            signal output Point() r;
+            component c = Src();
+            r <== c.p;
+        }
+        "#,
+    );
+    assert_eq!(kind_count(&diags, DiagnosticKind::BusTypeMismatch), 0);
+}
+
+#[test]
+fn bus_type_mismatch_across_arrays() {
+    let diags = types_of(
+        r#"
+        pragma circom 2.2.0;
+        bus A() { signal v; }
+        bus B() { signal v; }
+        template T(n) {
+            signal input A() xs[n];
+            signal output B() ys[n];
+            ys[0] <== xs[0];
+        }
+        "#,
+    );
+    assert_eq!(kind_count(&diags, DiagnosticKind::BusTypeMismatch), 1);
+}
+
+#[test]
+fn parameterized_bus_instantiation_accepts_arguments() {
+    // Parameterized bus instances parse and populate the symbol table
+    // without diagnostics; the parameter expression is recorded on the
+    // signal's declaration span (no bus-type check triggered since the
+    // type-name matches).
+    let diags = types_of(
+        r#"
+        pragma circom 2.2.0;
+        bus Vec(n) { signal v[n]; }
+        template T(n) {
+            signal input Vec(n) a;
+            signal output Vec(n) b;
+            b <== a;
+        }
+        "#,
+    );
+    assert_eq!(kind_count(&diags, DiagnosticKind::BusTypeMismatch), 0);
+}
+
 #[test]
 fn symbol_table_qualified_resolution_across_include() {
     let mut table = SymbolTable::new();

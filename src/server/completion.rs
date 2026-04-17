@@ -873,6 +873,39 @@ mod tests {
         assert!(labels.contains(&"y"));
     }
 
+    // ── Dot completion: nested bus field ───────────────────────────
+
+    #[test]
+    fn dot_completion_component_bus_output() {
+        let src = concat!(
+            "pragma circom \"2.2.0\";\n",
+            "bus Point() {\n",
+            "    signal x;\n",
+            "    signal y;\n",
+            "}\n",
+            "template P() {\n",
+            "    signal output Point() out;\n",
+            "}\n",
+            "template Foo() {\n",
+            "    component c = P();\n",
+            "    c.\n",
+            "}\n",
+        );
+        let (ast, table) = build_table(src);
+        let offset = src.find("c.\n").unwrap() + 2;
+        let ctx = detect_context(src, offset, &ast, &table, "test.circom");
+        match &ctx {
+            CompletionContext::DotAccess { receiver, .. } => {
+                assert_eq!(receiver, "c");
+            }
+            other => panic!("expected DotAccess, got {other:?}"),
+        }
+        let items = completions(&ctx, &table, "test.circom");
+        let labels: Vec<&str> = items.iter().map(|i| i.label.as_str()).collect();
+        // Component dot surfaces the bus-typed signal field itself.
+        assert!(labels.contains(&"out"));
+    }
+
     // ── Dot completion: signal.tag ───────���────────────────────────
 
     #[test]

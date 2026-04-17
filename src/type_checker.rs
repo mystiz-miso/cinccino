@@ -532,11 +532,13 @@ impl<'a> TypeChecker<'a> {
                 // <== or <-- : LHS should be a signal (output or intermediate)
                 self.check_signal_assign_target(&assign.lhs, assign.op);
                 self.check_tag_propagation(&assign.lhs, &assign.rhs);
+                self.check_bus_type_match(&assign.lhs, &assign.rhs);
             }
             AssignOp::SafeRight | AssignOp::UnsafeRight => {
                 // ==> or --> : RHS is the signal being assigned
                 self.check_signal_assign_target(&assign.rhs, assign.op);
                 self.check_tag_propagation(&assign.rhs, &assign.lhs);
+                self.check_bus_type_match(&assign.rhs, &assign.lhs);
             }
             AssignOp::Eq => {
                 // = : should be used for variables, not signals
@@ -546,6 +548,100 @@ impl<'a> TypeChecker<'a> {
         // Validate any anonymous-component instantiations contained within.
         self.check_anon_comps_in_expr(&assign.lhs);
         self.check_anon_comps_in_expr(&assign.rhs);
+    }
+
+    /// When a bus-typed signal appears as the target of `<==` / `<--`, the
+    /// source must carry the same bus type. We resolve both sides through
+    /// any indexing / member access and compare their declared bus type
+    /// names. If neither side resolves to a bus, this check is a no-op.
+    fn check_bus_type_match(&mut self, lhs_expr: &Expression, rhs_expr: &Expression) {
+        let Some(lhs_bus) = self.resolve_bus_type(lhs_expr) else {
+            return;
+        };
+        let rhs_bus = self.resolve_bus_type(rhs_expr);
+        match rhs_bus {
+            Some(rb) if rb == lhs_bus => {}
+            Some(rb) => {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: rhs_expr.span,
+                    message: format!("bus type mismatch: expected '{lhs_bus}', found '{rb}'"),
+                    kind: DiagnosticKind::BusTypeMismatch,
+                    file: self.file.clone(),
+                });
+            }
+            None => {
+                // RHS is not itself a bus-typed signal. Only flag when the
+                // RHS is a bare reference we could resolve to a non-bus
+                // signal — complex expressions (literals, arithmetic) are
+                // skipped because Circom's bus initialization semantics
+                // allow bus construction via assignment in those cases.
+                if let Some(rhs_name) = rhs_expr.extract_base_name() {
+                    if self.is_non_bus_signal(&rhs_name) {
+                        self.diagnostics.push(SymbolDiagnostic {
+                            span: rhs_expr.span,
+                            message: format!(
+                                "bus type mismatch: expected '{lhs_bus}', found non-bus signal '{rhs_name}'"
+                            ),
+                            kind: DiagnosticKind::BusTypeMismatch,
+                            file: self.file.clone(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    /// Follow an expression through `Index` / `Member` nodes and return the
+    /// bus-type name of the underlying signal, if any. Handles:
+    /// - `x` where `x` is a bus-typed signal
+    /// - `x[i]` / `x[i][j]` (arrays preserve element type)
+    /// - `c.b` where `c` is a component and `b` is a bus-typed field of
+    ///   its template
+    /// - `p.inner` where `p` is a bus-typed signal and `inner` is a nested
+    ///   bus field
+    fn resolve_bus_type(&self, expr: &Expression) -> Option<String> {
+        match expr.kind.as_ref() {
+            ExpressionKind::Ident(name) => self.bus_type_of_name(name),
+            ExpressionKind::Index(base, _) => self.resolve_bus_type(base),
+            ExpressionKind::Paren(inner) => self.resolve_bus_type(inner),
+            ExpressionKind::Member(base, field) => self.resolve_member_bus_type(base, field),
+            _ => None,
+        }
+    }
+
+    fn resolve_member_bus_type(&self, base: &Expression, field: &Identifier) -> Option<String> {
+        let parts = collect_member_path(base, field)?;
+        let refs: Vec<&str> = parts.iter().map(String::as_str).collect();
+        let sym = self
+            .table
+            .resolve_qualified(self.current_scope, &refs, &self.file)?;
+        match &sym.kind {
+            SymbolKind::Signal(s) => s.bus_type.clone(),
+            _ => None,
+        }
+    }
+
+    fn bus_type_of_name(&self, name: &str) -> Option<String> {
+        let sym = self
+            .table
+            .lookup_with_includes(self.current_scope, name, &self.file)?;
+        match &sym.kind {
+            SymbolKind::Signal(s) => s.bus_type.clone(),
+            _ => None,
+        }
+    }
+
+    fn is_non_bus_signal(&self, name: &str) -> bool {
+        match self
+            .table
+            .lookup_with_includes(self.current_scope, name, &self.file)
+        {
+            Some(sym) => matches!(
+                &sym.kind,
+                SymbolKind::Signal(s) if s.bus_type.is_none()
+            ),
+            None => false,
+        }
     }
 
     /// Walk an expression and validate every `AnonymousComp` found: parameter
@@ -862,6 +958,38 @@ struct TemplateSignalInfo {
 struct ComponentAccess {
     reads: HashMap<String, Vec<(String, Span)>>,
     writes: HashMap<String, Vec<(String, Span)>>,
+}
+
+/// Collect `[base, ..., field]` name segments for a `Member(...)` chain.
+/// Returns `None` if the chain contains anything other than idents, index
+/// ops (skipped), or member accesses — e.g. calls or arithmetic.
+fn collect_member_path(base: &Expression, field: &Identifier) -> Option<Vec<String>> {
+    let mut parts = Vec::new();
+    if !collect_path_segments(base, &mut parts) {
+        return None;
+    }
+    parts.push(field.name.clone());
+    Some(parts)
+}
+
+fn collect_path_segments(expr: &Expression, out: &mut Vec<String>) -> bool {
+    match expr.kind.as_ref() {
+        ExpressionKind::Ident(name) => {
+            out.push(name.clone());
+            true
+        }
+        ExpressionKind::Index(base, _) | ExpressionKind::Paren(base) => {
+            collect_path_segments(base, out)
+        }
+        ExpressionKind::Member(base, field) => {
+            if !collect_path_segments(base, out) {
+                return false;
+            }
+            out.push(field.name.clone());
+            true
+        }
+        _ => false,
+    }
 }
 
 fn extract_template_name_from_expr(expr: &Expression) -> Option<String> {
@@ -1324,5 +1452,118 @@ mod tests {
         let errors = diags_of_kind(&diags, DiagnosticKind::UnknownComponentSignal);
         assert_eq!(errors.len(), 1, "got: {diags:?}");
         assert!(errors[0].message.contains("bogus"));
+    }
+
+    // ── Bus type matching (#46) ───────────────────────────────────
+
+    #[test]
+    fn bus_type_mismatch_flagged_on_safe_assign() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus A() { signal x; }
+            bus B() { signal x; }
+            template T() {
+                signal input A() a;
+                signal output B() b;
+                b <== a;
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert_eq!(errors.len(), 1, "got: {diags:?}");
+        assert!(errors[0].message.contains("'B'"));
+        assert!(errors[0].message.contains("'A'"));
+    }
+
+    #[test]
+    fn bus_type_match_no_diagnostic() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus Point() { signal x; signal y; }
+            template T() {
+                signal input Point() a;
+                signal output Point() b;
+                b <== a;
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert!(errors.is_empty(), "got: {diags:?}");
+    }
+
+    #[test]
+    fn bus_type_mismatch_with_plain_signal_rhs() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus Point() { signal x; }
+            template T() {
+                signal input plain;
+                signal output Point() p;
+                p <== plain;
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert_eq!(errors.len(), 1, "got: {diags:?}");
+        assert!(errors[0].message.contains("non-bus"));
+    }
+
+    #[test]
+    fn bus_type_mismatch_via_unsafe_assign() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus A() { signal x; }
+            bus B() { signal x; }
+            template T() {
+                signal input A() a;
+                signal output B() b;
+                b <-- a;
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert_eq!(errors.len(), 1, "got: {diags:?}");
+    }
+
+    #[test]
+    fn bus_type_mismatch_through_indexing() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus A() { signal x; }
+            bus B() { signal x; }
+            template T(n) {
+                signal input A() a[n];
+                signal output B() b[n];
+                b[0] <== a[0];
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert_eq!(errors.len(), 1, "got: {diags:?}");
+    }
+
+    #[test]
+    fn bus_type_match_via_component_member() {
+        let diags = parse_and_check(
+            r#"
+            pragma circom 2.2.0;
+            bus Point() { signal x; signal y; }
+            template Producer() {
+                signal output Point() p;
+            }
+            template T() {
+                signal output Point() r;
+                component c = Producer();
+                r <== c.p;
+            }
+            "#,
+        );
+        let errors = diags_of_kind(&diags, DiagnosticKind::BusTypeMismatch);
+        assert!(errors.is_empty(), "got: {diags:?}");
     }
 }

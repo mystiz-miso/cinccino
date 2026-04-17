@@ -151,6 +151,8 @@ pub enum DiagnosticKind {
     MissingComponentInput,
     /// An output signal of the enclosing template is never assigned.
     UnderconstrainedOutput,
+    /// Bus-typed signal assigned from a different bus type (`<==` / `<--`).
+    BusTypeMismatch,
 }
 
 #[cfg(test)]

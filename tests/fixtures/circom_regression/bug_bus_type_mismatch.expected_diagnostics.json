@@ -1,0 +1,6 @@
+{
+  "note": "Assigning a bus of type A into a signal of bus type B is invalid.",
+  "diagnostics": [
+    { "kind": "BusTypeMismatch" }
+  ]
+}
