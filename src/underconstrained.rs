@@ -57,6 +57,101 @@ pub fn analyze(table: &SymbolTable, file_path: &str, ast: &File) -> Vec<SymbolDi
     diagnostics
 }
 
+fn compute_incidence(
+    signals: &HashMap<String, SignalInfo>,
+    constraints: &[Constraint],
+) -> (HashSet<String>, HashMap<String, bool>) {
+    let mut mentioned_by_some_constraint: HashSet<String> = HashSet::new();
+    let mut output_is_driven: HashMap<String, bool> = signals
+        .iter()
+        .filter(|(_, info)| info.kind == SignalKind::Output)
+        .map(|(name, _)| (name.clone(), false))
+        .collect();
+
+    for c in constraints {
+        for sig in &c.signals {
+            mentioned_by_some_constraint.insert(sig.clone());
+        }
+        if let Some(lhs) = &c.driven {
+            if let Some(driven) = output_is_driven.get_mut(lhs) {
+                *driven = true;
+            }
+        }
+    }
+    (mentioned_by_some_constraint, output_is_driven)
+}
+
+fn warn_undriven_outputs(
+    output_is_driven: &HashMap<String, bool>,
+    signals: &HashMap<String, SignalInfo>,
+    file_path: &str,
+    diagnostics: &mut Vec<SymbolDiagnostic>,
+) {
+    for (name, driven) in output_is_driven {
+        if *driven {
+            continue;
+        }
+        if let Some(info) = signals.get(name) {
+            diagnostics.push(SymbolDiagnostic {
+                span: info.span,
+                message: format!(
+                    "output signal '{name}' is never assigned by a '<==' or '===' constraint"
+                ),
+                kind: DiagnosticKind::UnderconstrainedOutput,
+                file: file_path.to_string(),
+            });
+        }
+    }
+}
+
+fn warn_dangling_signals(
+    signals: &HashMap<String, SignalInfo>,
+    mentioned: &HashSet<String>,
+    file_path: &str,
+    diagnostics: &mut Vec<SymbolDiagnostic>,
+) {
+    for (name, info) in signals {
+        // Inputs are never under-constrained; outputs are handled elsewhere.
+        if matches!(info.kind, SignalKind::Input | SignalKind::Output) {
+            continue;
+        }
+        if !mentioned.contains(name) {
+            diagnostics.push(SymbolDiagnostic {
+                span: info.span,
+                message: format!("signal '{name}' is declared but never appears in any constraint"),
+                kind: DiagnosticKind::UnderconstrainedOutput,
+                file: file_path.to_string(),
+            });
+        }
+    }
+}
+
+fn warn_global_count(
+    signals: &HashMap<String, SignalInfo>,
+    constraints: &[Constraint],
+    tpl: &TemplateDef,
+    file_path: &str,
+    diagnostics: &mut Vec<SymbolDiagnostic>,
+) {
+    let non_input_count = signals
+        .values()
+        .filter(|info| info.kind != SignalKind::Input)
+        .count();
+    if non_input_count > constraints.len() && !constraints.is_empty() {
+        diagnostics.push(SymbolDiagnostic {
+            span: tpl.name.span,
+            message: format!(
+                "template '{}' has {} non-input signals but only {} constraint(s); some signals may be underconstrained",
+                tpl.name.name,
+                non_input_count,
+                constraints.len()
+            ),
+            kind: DiagnosticKind::UnderconstrainedOutput,
+            file: file_path.to_string(),
+        });
+    }
+}
+
 fn analyze_template(
     table: &SymbolTable,
     file_path: &str,
@@ -80,86 +175,10 @@ fn analyze_template(
     let mut constraints: Vec<Constraint> = Vec::new();
     collect_constraints_in_block(&tpl.body, &signals, &mut constraints);
 
-    // Build the bipartite incidence and derived sets.
-    let mut mentioned_by_some_constraint: HashSet<String> = HashSet::new();
-    let mut output_is_driven: HashMap<String, bool> = signals
-        .iter()
-        .filter(|(_, info)| info.kind == SignalKind::Output)
-        .map(|(name, _)| (name.clone(), false))
-        .collect();
-
-    for c in &constraints {
-        for sig in &c.signals {
-            mentioned_by_some_constraint.insert(sig.clone());
-        }
-        if let Some(lhs) = &c.driven {
-            if let Some(driven) = output_is_driven.get_mut(lhs) {
-                *driven = true;
-            }
-        }
-    }
-
-    // 1. Outputs that are never driven by a `<==` or `===` with themselves on
-    //    one side — the classic "forgotten output" bug.
-    for (name, driven) in &output_is_driven {
-        if !*driven {
-            if let Some(info) = signals.get(name) {
-                diagnostics.push(SymbolDiagnostic {
-                    span: info.span,
-                    message: format!(
-                        "output signal '{name}' is never assigned by a '<==' or '===' constraint"
-                    ),
-                    kind: DiagnosticKind::UnderconstrainedOutput,
-                    file: file_path.to_string(),
-                });
-            }
-        }
-    }
-
-    // 2. Non-input signals never touched by any constraint (fully dangling).
-    //    We skip pure intermediates that *might* be used via component
-    //    wiring (c.x <== s) because such wires flow through member access,
-    //    which we already count in `signals`.
-    for (name, info) in &signals {
-        if info.kind == SignalKind::Input {
-            continue;
-        }
-        // Outputs already handled above.
-        if info.kind == SignalKind::Output {
-            continue;
-        }
-        if !mentioned_by_some_constraint.contains(name) {
-            diagnostics.push(SymbolDiagnostic {
-                span: info.span,
-                message: format!("signal '{name}' is declared but never appears in any constraint"),
-                kind: DiagnosticKind::UnderconstrainedOutput,
-                file: file_path.to_string(),
-            });
-        }
-    }
-
-    // 3. Global count heuristic: if the template declares more non-input
-    //    signals than it produces constraints, at least one signal is
-    //    necessarily free. We only warn on the *template* span, not on a
-    //    specific signal, because pinpointing which one would need full
-    //    rank analysis.
-    let non_input_count = signals
-        .values()
-        .filter(|info| info.kind != SignalKind::Input)
-        .count();
-    if non_input_count > constraints.len() && !constraints.is_empty() {
-        diagnostics.push(SymbolDiagnostic {
-            span: tpl.name.span,
-            message: format!(
-                "template '{}' has {} non-input signals but only {} constraint(s); some signals may be underconstrained",
-                tpl.name.name,
-                non_input_count,
-                constraints.len()
-            ),
-            kind: DiagnosticKind::UnderconstrainedOutput,
-            file: file_path.to_string(),
-        });
-    }
+    let (mentioned, output_is_driven) = compute_incidence(&signals, &constraints);
+    warn_undriven_outputs(&output_is_driven, &signals, file_path, diagnostics);
+    warn_dangling_signals(&signals, &mentioned, file_path, diagnostics);
+    warn_global_count(&signals, &constraints, tpl, file_path, diagnostics);
 }
 
 /// Info we cache about a signal while walking the template body.
@@ -209,99 +228,108 @@ fn collect_constraints_in_block(
     }
 }
 
+fn constraint_from_eq(c: &ConstraintEqStmt, signals: &HashMap<String, SignalInfo>) -> Constraint {
+    let mut sigs = HashSet::new();
+    collect_signal_refs(&c.lhs, signals, &mut sigs);
+    collect_signal_refs(&c.rhs, signals, &mut sigs);
+    // A `===` constraint drives either side if that side is a
+    // bare signal ref; we accept either.
+    let driven = c
+        .lhs
+        .extract_base_name()
+        .filter(|n| signals.contains_key(n))
+        .or_else(|| {
+            c.rhs
+                .extract_base_name()
+                .filter(|n| signals.contains_key(n))
+        });
+    Constraint {
+        signals: sigs,
+        driven,
+    }
+}
+
+fn constraint_from_assignment(
+    a: &AssignStmt,
+    signals: &HashMap<String, SignalInfo>,
+) -> Option<Constraint> {
+    let (driven_side, driven_op) = match a.op {
+        AssignOp::SafeLeft => (&a.lhs, true),
+        AssignOp::SafeRight => (&a.rhs, true),
+        AssignOp::UnsafeLeft | AssignOp::UnsafeRight | AssignOp::Eq => return None,
+    };
+    if !driven_op {
+        return None;
+    }
+    let mut sigs = HashSet::new();
+    collect_signal_refs(&a.lhs, signals, &mut sigs);
+    collect_signal_refs(&a.rhs, signals, &mut sigs);
+    let driven = driven_side
+        .extract_base_name()
+        .filter(|n| signals.contains_key(n));
+    Some(Constraint {
+        signals: sigs,
+        driven,
+    })
+}
+
+fn constraints_from_tuple_assign(
+    t: &TupleAssignStmt,
+    signals: &HashMap<String, SignalInfo>,
+    out: &mut Vec<Constraint>,
+) {
+    if !matches!(t.op, AssignOp::SafeLeft) {
+        return;
+    }
+    for target in t.targets.iter().flatten() {
+        let mut sigs = HashSet::new();
+        collect_signal_refs(target, signals, &mut sigs);
+        collect_signal_refs(&t.rhs, signals, &mut sigs);
+        let driven = target
+            .extract_base_name()
+            .filter(|n| signals.contains_key(n));
+        out.push(Constraint {
+            signals: sigs,
+            driven,
+        });
+    }
+}
+
+fn constraints_from_signal_decl(
+    s: &SignalDecl,
+    signals: &HashMap<String, SignalInfo>,
+    out: &mut Vec<Constraint>,
+) {
+    // `signal output o <== expr;` is a constraint in disguise.
+    for entry in &s.names {
+        if let Some((op, init)) = &entry.init {
+            if *op == SignalAssignOp::SafeLeft {
+                let mut sigs = HashSet::new();
+                sigs.insert(entry.name.name.clone());
+                collect_signal_refs(init, signals, &mut sigs);
+                out.push(Constraint {
+                    signals: sigs,
+                    driven: Some(entry.name.name.clone()),
+                });
+            }
+        }
+    }
+}
+
 fn collect_constraints_in_stmt(
     stmt: &Statement,
     signals: &HashMap<String, SignalInfo>,
     out: &mut Vec<Constraint>,
 ) {
     match &stmt.kind {
-        StatementKind::ConstraintEq(c) => {
-            let mut sigs = HashSet::new();
-            collect_signal_refs(&c.lhs, signals, &mut sigs);
-            collect_signal_refs(&c.rhs, signals, &mut sigs);
-            // A `===` constraint drives either side if that side is a
-            // bare signal ref; we accept either.
-            let driven = c
-                .lhs
-                .extract_base_name()
-                .filter(|n| signals.contains_key(n))
-                .or_else(|| {
-                    c.rhs
-                        .extract_base_name()
-                        .filter(|n| signals.contains_key(n))
-                });
-            out.push(Constraint {
-                signals: sigs,
-                driven,
-            });
-        }
-        StatementKind::Assignment(a) => match a.op {
-            AssignOp::SafeLeft | AssignOp::UnsafeLeft => {
-                let mut sigs = HashSet::new();
-                collect_signal_refs(&a.lhs, signals, &mut sigs);
-                collect_signal_refs(&a.rhs, signals, &mut sigs);
-                let driven = a
-                    .lhs
-                    .extract_base_name()
-                    .filter(|n| signals.contains_key(n));
-                // Only `<==` produces a constraint; `<--` assigns the
-                // witness without constraining it.
-                if a.op == AssignOp::SafeLeft {
-                    out.push(Constraint {
-                        signals: sigs,
-                        driven,
-                    });
-                }
-            }
-            AssignOp::SafeRight | AssignOp::UnsafeRight => {
-                let mut sigs = HashSet::new();
-                collect_signal_refs(&a.lhs, signals, &mut sigs);
-                collect_signal_refs(&a.rhs, signals, &mut sigs);
-                let driven = a
-                    .rhs
-                    .extract_base_name()
-                    .filter(|n| signals.contains_key(n));
-                if a.op == AssignOp::SafeRight {
-                    out.push(Constraint {
-                        signals: sigs,
-                        driven,
-                    });
-                }
-            }
-            AssignOp::Eq => {}
-        },
-        StatementKind::TupleAssign(t) => {
-            if matches!(t.op, AssignOp::SafeLeft) {
-                for target in t.targets.iter().flatten() {
-                    let mut sigs = HashSet::new();
-                    collect_signal_refs(target, signals, &mut sigs);
-                    collect_signal_refs(&t.rhs, signals, &mut sigs);
-                    let driven = target
-                        .extract_base_name()
-                        .filter(|n| signals.contains_key(n));
-                    out.push(Constraint {
-                        signals: sigs,
-                        driven,
-                    });
-                }
+        StatementKind::ConstraintEq(c) => out.push(constraint_from_eq(c, signals)),
+        StatementKind::Assignment(a) => {
+            if let Some(c) = constraint_from_assignment(a, signals) {
+                out.push(c);
             }
         }
-        StatementKind::SignalDecl(s) => {
-            // `signal output o <== expr;` is a constraint in disguise.
-            for entry in &s.names {
-                if let Some((op, init)) = &entry.init {
-                    if *op == SignalAssignOp::SafeLeft {
-                        let mut sigs = HashSet::new();
-                        sigs.insert(entry.name.name.clone());
-                        collect_signal_refs(init, signals, &mut sigs);
-                        out.push(Constraint {
-                            signals: sigs,
-                            driven: Some(entry.name.name.clone()),
-                        });
-                    }
-                }
-            }
-        }
+        StatementKind::TupleAssign(t) => constraints_from_tuple_assign(t, signals, out),
+        StatementKind::SignalDecl(s) => constraints_from_signal_decl(s, signals, out),
         StatementKind::For(f) => collect_constraints_in_block(&f.body, signals, out),
         StatementKind::While(w) => collect_constraints_in_block(&w.body, signals, out),
         StatementKind::IfElse(ie) => {

@@ -78,13 +78,15 @@ impl IncrementalParser {
         parser
     }
 
-    /// Apply an incremental text edit and re-parse only the affected
-    /// region.  Returns the updated AST and parse errors.
-    pub fn update(&mut self, new_source: &str, edit: &TextEdit) -> (File, Vec<ParseError>) {
-        let delta = edit.delta();
+    /// Determine the region of `new_source` to re-parse and the range of
+    /// cached entries to replace.
+    fn compute_reparse_window(
+        &self,
+        new_source: &str,
+        edit: &TextEdit,
+        delta: isize,
+    ) -> (usize, usize, std::ops::Range<usize>) {
         let old_range = edit.old_range();
-
-        // Find indices of items that overlap the edited range.
         let first_affected = self
             .entries
             .iter()
@@ -94,33 +96,67 @@ impl IncrementalParser {
             .iter()
             .rposition(|e| e.end > old_range.start && e.start < old_range.end);
 
-        // Determine re-parse window in the *new* source.
-        let (reparse_start, reparse_end, replace_range) =
-            if let (Some(first), Some(last)) = (first_affected, last_affected) {
-                let start = self.entries[first].start;
-                // End of the last affected item in new-source coordinates.
-                let raw_end = self.entries[last]
+        if let (Some(first), Some(last)) = (first_affected, last_affected) {
+            let start = self.entries[first].start;
+            // End of the last affected item in new-source coordinates.
+            let raw_end = self.entries[last]
+                .end
+                .checked_add_signed(delta)
+                .expect("span underflow in reparse window");
+            // The re-parse window must cover at least the inserted text.
+            let end = raw_end
+                .max(edit.start + edit.inserted)
+                .min(new_source.len());
+            (start, end.max(start), first..last + 1)
+        } else {
+            // Edit is in whitespace between items (or at start/end
+            // of file outside any item).  Re-parse the gap.
+            let start = edit.start;
+            let end = (edit.start + edit.inserted).min(new_source.len());
+            // Insert point: the index where new items would go.
+            let insert_at = self
+                .entries
+                .iter()
+                .position(|e| e.start >= edit.start)
+                .unwrap_or(self.entries.len());
+            (start, end, insert_at..insert_at)
+        }
+    }
+
+    /// Shift spans and errors of cached entries that follow the replaced range.
+    fn shift_entries_after(&mut self, start: usize, delta: isize) {
+        for entry in self.entries[start..].iter_mut() {
+            entry.start = entry
+                .start
+                .checked_add_signed(delta)
+                .expect("span underflow in entry start");
+            entry.end = entry
+                .end
+                .checked_add_signed(delta)
+                .expect("span underflow in entry end");
+            shift_item_spans(&mut entry.item, delta);
+            for err in &mut entry.errors {
+                err.span.start = err
+                    .span
+                    .start
+                    .checked_add_signed(delta)
+                    .expect("span underflow in error start");
+                err.span.end = err
+                    .span
                     .end
                     .checked_add_signed(delta)
-                    .expect("span underflow in reparse window");
-                // The re-parse window must cover at least the inserted text.
-                let end = raw_end
-                    .max(edit.start + edit.inserted)
-                    .min(new_source.len());
-                (start, end.max(start), first..last + 1)
-            } else {
-                // Edit is in whitespace between items (or at start/end
-                // of file outside any item).  Re-parse the gap.
-                let start = edit.start;
-                let end = (edit.start + edit.inserted).min(new_source.len());
-                // Insert point: the index where new items would go.
-                let insert_at = self
-                    .entries
-                    .iter()
-                    .position(|e| e.start >= edit.start)
-                    .unwrap_or(self.entries.len());
-                (start, end, insert_at..insert_at)
-            };
+                    .expect("span underflow in error end");
+            }
+        }
+    }
+
+    /// Apply an incremental text edit and re-parse only the affected
+    /// region.  Returns the updated AST and parse errors.
+    pub fn update(&mut self, new_source: &str, edit: &TextEdit) -> (File, Vec<ParseError>) {
+        let delta = edit.delta();
+
+        let (reparse_start, reparse_end, replace_range) =
+            self.compute_reparse_window(new_source, edit, delta);
 
         // Re-parse the affected region as if it were a standalone file.
         let region = &new_source[reparse_start..reparse_end];
@@ -153,29 +189,7 @@ impl IncrementalParser {
             .collect();
 
         // Shift spans and errors of items after the affected region.
-        for entry in self.entries[replace_range.end..].iter_mut() {
-            entry.start = entry
-                .start
-                .checked_add_signed(delta)
-                .expect("span underflow in entry start");
-            entry.end = entry
-                .end
-                .checked_add_signed(delta)
-                .expect("span underflow in entry end");
-            shift_item_spans(&mut entry.item, delta);
-            for err in &mut entry.errors {
-                err.span.start = err
-                    .span
-                    .start
-                    .checked_add_signed(delta)
-                    .expect("span underflow in error start");
-                err.span.end = err
-                    .span
-                    .end
-                    .checked_add_signed(delta)
-                    .expect("span underflow in error end");
-            }
-        }
+        self.shift_entries_after(replace_range.end, delta);
 
         // Splice in the newly parsed items.
         self.entries.splice(replace_range.clone(), new_items);
@@ -331,63 +345,101 @@ fn shift_block(block: &mut crate::ast::Block, delta: isize) {
     }
 }
 
+fn shift_var_decl(v: &mut crate::ast::VarDecl, delta: isize) {
+    shift_span(&mut v.span, delta);
+    for entry in &mut v.names {
+        shift_ident(&mut entry.name, delta);
+        for d in &mut entry.dimensions {
+            shift_expr(d, delta);
+        }
+        if let Some(init) = &mut entry.init {
+            shift_expr(init, delta);
+        }
+    }
+}
+
+fn shift_signal_decl(s: &mut crate::ast::SignalDecl, delta: isize) {
+    shift_span(&mut s.span, delta);
+    for tag in &mut s.tags {
+        shift_ident(tag, delta);
+    }
+    for entry in &mut s.names {
+        shift_ident(&mut entry.name, delta);
+        for d in &mut entry.dimensions {
+            shift_expr(d, delta);
+        }
+        if let Some((_, init)) = &mut entry.init {
+            shift_expr(init, delta);
+        }
+    }
+}
+
+fn shift_component_decl(c: &mut crate::ast::ComponentDecl, delta: isize) {
+    shift_span(&mut c.span, delta);
+    for entry in &mut c.names {
+        shift_ident(&mut entry.name, delta);
+        for d in &mut entry.dimensions {
+            shift_expr(d, delta);
+        }
+        if let Some(init) = &mut entry.init {
+            shift_expr(init, delta);
+        }
+    }
+}
+
+fn shift_bus_instance_decl(b: &mut crate::ast::BusInstanceDecl, delta: isize) {
+    shift_span(&mut b.span, delta);
+    shift_bus_type(&mut b.bus_type, delta);
+    for tag in &mut b.tags {
+        shift_ident(tag, delta);
+    }
+    shift_ident(&mut b.name, delta);
+    for d in &mut b.dimensions {
+        shift_expr(d, delta);
+    }
+    if let Some((_, init)) = &mut b.init {
+        shift_expr(init, delta);
+    }
+}
+
+fn shift_tuple_assign(t: &mut crate::ast::TupleAssignStmt, delta: isize) {
+    for e in t.targets.iter_mut().flatten() {
+        shift_expr(e, delta);
+    }
+    shift_expr(&mut t.rhs, delta);
+}
+
+fn shift_if_else(ie: &mut crate::ast::IfElse, delta: isize) {
+    shift_expr(&mut ie.cond, delta);
+    shift_block(&mut ie.then_body, delta);
+    if let Some(else_body) = &mut ie.else_body {
+        shift_block(else_body, delta);
+    }
+}
+
+fn shift_for_loop(f: &mut crate::ast::ForLoop, delta: isize) {
+    shift_stmt(f.init.as_mut(), delta);
+    shift_expr(&mut f.cond, delta);
+    shift_stmt(f.step.as_mut(), delta);
+    shift_block(&mut f.body, delta);
+}
+
+fn shift_log(l: &mut crate::ast::LogStmt, delta: isize) {
+    for arg in &mut l.args {
+        if let crate::ast::LogArg::Expr(e) = arg {
+            shift_expr(e, delta);
+        }
+    }
+}
+
 fn shift_stmt(stmt: &mut crate::ast::Statement, delta: isize) {
     use crate::ast::StatementKind::*;
     shift_span(&mut stmt.span, delta);
     match &mut stmt.kind {
-        VarDecl(v) => {
-            shift_span(&mut v.span, delta);
-            for entry in &mut v.names {
-                shift_ident(&mut entry.name, delta);
-                for d in &mut entry.dimensions {
-                    shift_expr(d, delta);
-                }
-                if let Some(init) = &mut entry.init {
-                    shift_expr(init, delta);
-                }
-            }
-        }
-        SignalDecl(s) => {
-            shift_span(&mut s.span, delta);
-            for tag in &mut s.tags {
-                shift_ident(tag, delta);
-            }
-            for entry in &mut s.names {
-                shift_ident(&mut entry.name, delta);
-                for d in &mut entry.dimensions {
-                    shift_expr(d, delta);
-                }
-                if let Some((_, init)) = &mut entry.init {
-                    shift_expr(init, delta);
-                }
-            }
-        }
-        ComponentDecl(c) => {
-            shift_span(&mut c.span, delta);
-            for entry in &mut c.names {
-                shift_ident(&mut entry.name, delta);
-                for d in &mut entry.dimensions {
-                    shift_expr(d, delta);
-                }
-                if let Some(init) = &mut entry.init {
-                    shift_expr(init, delta);
-                }
-            }
-        }
-        BusDecl(b) => {
-            shift_span(&mut b.span, delta);
-            shift_bus_type(&mut b.bus_type, delta);
-            for tag in &mut b.tags {
-                shift_ident(tag, delta);
-            }
-            shift_ident(&mut b.name, delta);
-            for d in &mut b.dimensions {
-                shift_expr(d, delta);
-            }
-            if let Some((_, init)) = &mut b.init {
-                shift_expr(init, delta);
-            }
-        }
+        VarDecl(v) => shift_var_decl(v, delta),
+        SignalDecl(s) => shift_signal_decl(s, delta),
+        ComponentDecl(c) => shift_component_decl(c, delta),
+        BusDecl(b) => shift_bus_instance_decl(b, delta),
         Assignment(a) => {
             shift_expr(&mut a.lhs, delta);
             shift_expr(&mut a.rhs, delta);
@@ -400,37 +452,15 @@ fn shift_stmt(stmt: &mut crate::ast::Statement, delta: isize) {
             shift_expr(&mut c.lhs, delta);
             shift_expr(&mut c.rhs, delta);
         }
-        TupleAssign(t) => {
-            for e in t.targets.iter_mut().flatten() {
-                shift_expr(e, delta);
-            }
-            shift_expr(&mut t.rhs, delta);
-        }
-        IfElse(ie) => {
-            shift_expr(&mut ie.cond, delta);
-            shift_block(&mut ie.then_body, delta);
-            if let Some(else_body) = &mut ie.else_body {
-                shift_block(else_body, delta);
-            }
-        }
-        For(f) => {
-            shift_stmt(f.init.as_mut(), delta);
-            shift_expr(&mut f.cond, delta);
-            shift_stmt(f.step.as_mut(), delta);
-            shift_block(&mut f.body, delta);
-        }
+        TupleAssign(t) => shift_tuple_assign(t, delta),
+        IfElse(ie) => shift_if_else(ie, delta),
+        For(f) => shift_for_loop(f, delta),
         While(w) => {
             shift_expr(&mut w.cond, delta);
             shift_block(&mut w.body, delta);
         }
         Return(r) => shift_expr(&mut r.value, delta),
-        Log(l) => {
-            for arg in &mut l.args {
-                if let crate::ast::LogArg::Expr(e) = arg {
-                    shift_expr(e, delta);
-                }
-            }
-        }
+        Log(l) => shift_log(l, delta),
         Assert(a) => shift_expr(&mut a.expr, delta),
         Increment(e) | Decrement(e) | Expression(e) => shift_expr(e, delta),
         Block(b) => shift_block(b, delta),

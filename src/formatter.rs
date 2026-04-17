@@ -379,41 +379,40 @@ impl<'a> Renderer<'a> {
         self.buf.push('}');
     }
 
+    fn render_simple_stmt_body(&mut self, stmt: &Statement) -> bool {
+        // Returns true if the statement was handled as a simple ";\n"-terminated form.
+        match &stmt.kind {
+            StatementKind::VarDecl(n) => self.render_var_decl(n),
+            StatementKind::SignalDecl(n) => self.render_signal_decl(n),
+            StatementKind::ComponentDecl(n) => self.render_component_decl(n),
+            StatementKind::BusDecl(n) => self.render_bus_instance_decl(n),
+            StatementKind::Assignment(n) => self.render_assign_stmt(n),
+            StatementKind::CompoundAssign(n) => self.render_compound_assign_stmt(n),
+            StatementKind::ConstraintEq(n) => self.render_constraint_eq_stmt(n),
+            StatementKind::TupleAssign(n) => self.render_tuple_assign_stmt(n),
+            StatementKind::Return(n) => {
+                self.buf.push_str("return ");
+                self.render_expr(&n.value);
+            }
+            StatementKind::Log(n) => self.render_log_stmt(n),
+            StatementKind::Assert(n) => {
+                self.buf.push_str("assert(");
+                self.render_expr(&n.expr);
+                self.buf.push(')');
+            }
+            StatementKind::Expression(expr) => self.render_expr(expr),
+            _ => return false,
+        }
+        self.buf.push_str(";\n");
+        true
+    }
+
     fn render_statement(&mut self, stmt: &Statement) {
         self.write_indent();
+        if self.render_simple_stmt_body(stmt) {
+            return;
+        }
         match &stmt.kind {
-            StatementKind::VarDecl(n) => {
-                self.render_var_decl(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::SignalDecl(n) => {
-                self.render_signal_decl(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::ComponentDecl(n) => {
-                self.render_component_decl(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::BusDecl(n) => {
-                self.render_bus_instance_decl(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::Assignment(n) => {
-                self.render_assign_stmt(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::CompoundAssign(n) => {
-                self.render_compound_assign_stmt(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::ConstraintEq(n) => {
-                self.render_constraint_eq_stmt(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::TupleAssign(n) => {
-                self.render_tuple_assign_stmt(n);
-                self.buf.push_str(";\n");
-            }
             StatementKind::IfElse(n) => {
                 self.render_if_else(n);
                 self.buf.push('\n');
@@ -426,20 +425,6 @@ impl<'a> Renderer<'a> {
                 self.render_while_loop(n);
                 self.buf.push('\n');
             }
-            StatementKind::Return(n) => {
-                self.buf.push_str("return ");
-                self.render_expr(&n.value);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::Log(n) => {
-                self.render_log_stmt(n);
-                self.buf.push_str(";\n");
-            }
-            StatementKind::Assert(n) => {
-                self.buf.push_str("assert(");
-                self.render_expr(&n.expr);
-                self.buf.push_str(");\n");
-            }
             StatementKind::Increment(expr) => {
                 self.render_expr(expr);
                 self.buf.push_str("++;\n");
@@ -448,15 +433,12 @@ impl<'a> Renderer<'a> {
                 self.render_expr(expr);
                 self.buf.push_str("--;\n");
             }
-            StatementKind::Expression(expr) => {
-                self.render_expr(expr);
-                self.buf.push_str(";\n");
-            }
             StatementKind::Block(blk) => {
                 self.render_block(blk);
                 self.buf.push('\n');
             }
             StatementKind::Error => self.buf.push_str("/* error */;\n"),
+            _ => {}
         }
     }
 
@@ -916,52 +898,9 @@ fn write_expr_inline(s: &mut String, expr: &Expression) {
             s.push('.');
             s.push_str(&ident.name);
         }
-        ExpressionKind::Call(callee, args) => {
-            write_expr_inline(s, callee);
-            s.push('(');
-            for (i, a) in args.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                write_expr_inline(s, a);
-            }
-            s.push(')');
-        }
-        ExpressionKind::AnonymousComp(comp) => {
-            write_expr_inline(s, &comp.template);
-            s.push('(');
-            for (i, a) in comp.template_args.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                write_expr_inline(s, a);
-            }
-            s.push_str(")(");
-            for (i, input) in comp.inputs.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                match input {
-                    AnonCompInput::Positional(e) => write_expr_inline(s, e),
-                    AnonCompInput::Named(id, e) => {
-                        s.push_str(&id.name);
-                        s.push_str(" <== ");
-                        write_expr_inline(s, e);
-                    }
-                }
-            }
-            s.push(')');
-        }
-        ExpressionKind::ArrayLit(elems) => {
-            s.push('[');
-            for (i, e) in elems.iter().enumerate() {
-                if i > 0 {
-                    s.push_str(", ");
-                }
-                write_expr_inline(s, e);
-            }
-            s.push(']');
-        }
+        ExpressionKind::Call(callee, args) => write_call_inline(s, callee, args),
+        ExpressionKind::AnonymousComp(comp) => write_anon_comp_inline(s, comp),
+        ExpressionKind::ArrayLit(elems) => write_array_lit_inline(s, elems),
         ExpressionKind::Paren(e) => {
             s.push('(');
             write_expr_inline(s, e);
@@ -974,6 +913,55 @@ fn write_expr_inline(s: &mut String, expr: &Expression) {
         ExpressionKind::Underscore => s.push('_'),
         ExpressionKind::Error => s.push_str("/* error */"),
     }
+}
+
+fn write_call_inline(s: &mut String, callee: &Expression, args: &[Expression]) {
+    write_expr_inline(s, callee);
+    s.push('(');
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write_expr_inline(s, a);
+    }
+    s.push(')');
+}
+
+fn write_anon_comp_inline(s: &mut String, comp: &AnonymousComp) {
+    write_expr_inline(s, &comp.template);
+    s.push('(');
+    for (i, a) in comp.template_args.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write_expr_inline(s, a);
+    }
+    s.push_str(")(");
+    for (i, input) in comp.inputs.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        match input {
+            AnonCompInput::Positional(e) => write_expr_inline(s, e),
+            AnonCompInput::Named(id, e) => {
+                s.push_str(&id.name);
+                s.push_str(" <== ");
+                write_expr_inline(s, e);
+            }
+        }
+    }
+    s.push(')');
+}
+
+fn write_array_lit_inline(s: &mut String, elems: &[Expression]) {
+    s.push('[');
+    for (i, e) in elems.iter().enumerate() {
+        if i > 0 {
+            s.push_str(", ");
+        }
+        write_expr_inline(s, e);
+    }
+    s.push(']');
 }
 
 fn binary_op_str(op: BinaryOp) -> &'static str {

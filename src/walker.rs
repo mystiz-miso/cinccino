@@ -916,12 +916,113 @@ mod tests {
         }
     }
 
-    /// Exercises the "enter returns false" early-return path in every
-    /// walk_* function by parsing a comprehensive source and calling
-    /// each walk function with SkipAllWalker directly on extracted nodes.
-    #[test]
-    fn walker_skip_all_exercises_every_walk_fn() {
-        let src = r#"
+    fn skip_all_walk_statement_kind(s: &mut SkipAllWalker, stmt: &Statement) {
+        match &stmt.kind {
+            StatementKind::VarDecl(n) => {
+                walk_var_decl(s, n);
+                for e in &n.names {
+                    walk_var_decl_entry(s, e);
+                }
+            }
+            StatementKind::SignalDecl(n) => {
+                walk_signal_decl(s, n);
+                for e in &n.names {
+                    walk_signal_decl_entry(s, e);
+                }
+            }
+            StatementKind::ComponentDecl(n) => {
+                walk_component_decl(s, n);
+                for e in &n.names {
+                    walk_component_decl_entry(s, e);
+                }
+            }
+            StatementKind::BusDecl(n) => {
+                walk_bus_instance_decl(s, n);
+                walk_bus_type(s, &n.bus_type);
+            }
+            StatementKind::Assignment(n) => walk_assign_stmt(s, n),
+            StatementKind::CompoundAssign(n) => walk_compound_assign_stmt(s, n),
+            StatementKind::ConstraintEq(n) => walk_constraint_eq_stmt(s, n),
+            StatementKind::TupleAssign(n) => walk_tuple_assign_stmt(s, n),
+            StatementKind::IfElse(n) => walk_if_else(s, n),
+            StatementKind::For(n) => walk_for_loop(s, n),
+            StatementKind::While(n) => walk_while_loop(s, n),
+            StatementKind::Log(n) => {
+                walk_log_stmt(s, n);
+                for arg in &n.args {
+                    walk_log_arg(s, arg);
+                }
+            }
+            StatementKind::Assert(n) => walk_assert_stmt(s, n),
+            StatementKind::Return(n) => walk_return_stmt(s, n),
+            StatementKind::Increment(e)
+            | StatementKind::Decrement(e)
+            | StatementKind::Expression(e) => walk_expression(s, e),
+            StatementKind::Block(blk) => walk_block(s, blk),
+            StatementKind::Error => {}
+        }
+    }
+
+    fn skip_all_walk_template_body(s: &mut SkipAllWalker, n: &TemplateDef) {
+        walk_template_def(s, n);
+        walk_block(s, &n.body);
+        for stmt in &n.body.stmts {
+            walk_statement(s, stmt);
+            skip_all_walk_statement_kind(s, stmt);
+        }
+    }
+
+    fn skip_all_walk_function_body(s: &mut SkipAllWalker, n: &FunctionDef) {
+        walk_function_def(s, n);
+        for stmt in &n.body.stmts {
+            walk_statement(s, stmt);
+            if let StatementKind::Return(r) = &stmt.kind {
+                walk_return_stmt(s, r);
+            }
+        }
+    }
+
+    fn skip_all_walk_bus_body(s: &mut SkipAllWalker, n: &BusDef) {
+        walk_bus_def(s, n);
+        for member in &n.body {
+            walk_bus_member(s, member);
+            if let BusMember::Bus(f) = member {
+                walk_bus_field_decl(s, f);
+            }
+        }
+    }
+
+    fn skip_all_walk_item(s: &mut SkipAllWalker, item: &Item) {
+        match item {
+            Item::Pragma(n) => walk_pragma(s, n),
+            Item::Include(n) => walk_include(s, n),
+            Item::TemplateDef(n) => skip_all_walk_template_body(s, n),
+            Item::FunctionDef(n) => skip_all_walk_function_body(s, n),
+            Item::BusDef(n) => skip_all_walk_bus_body(s, n),
+            Item::MainComponent(n) => walk_main_component(s, n),
+        }
+    }
+
+    fn skip_all_walk_anon_comps(file: &File) {
+        for item in &file.items {
+            if let Item::TemplateDef(t) = item {
+                for stmt in &t.body.stmts {
+                    if let StatementKind::Assignment(a) = &stmt.kind {
+                        if let ExpressionKind::AnonymousComp(comp) = a.rhs.kind.as_ref() {
+                            let mut s = SkipAllWalker;
+                            walk_anonymous_comp(&mut s, comp);
+                            for input in &comp.inputs {
+                                walk_anon_comp_input(&mut s, input);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    fn comprehensive_walker_fixture() -> &'static str {
+        r#"
             pragma circom 2.2.0;
             include "other.circom";
             bus MyBus() {
@@ -953,7 +1054,15 @@ mod tests {
                 return a + b;
             }
             component main {public [a]} = T();
-        "#;
+        "#
+    }
+
+    /// Exercises the "enter returns false" early-return path in every
+    /// walk_* function by parsing a comprehensive source and calling
+    /// each walk function with SkipAllWalker directly on extracted nodes.
+    #[test]
+    fn walker_skip_all_exercises_every_walk_fn() {
+        let src = comprehensive_walker_fixture();
         let (file, errors) = parser::parse(src);
         assert!(errors.is_empty(), "parse errors: {errors:?}");
 
@@ -970,101 +1079,11 @@ mod tests {
         // walk into specific item types
         for item in &file.items {
             let mut s = SkipAllWalker;
-            match item {
-                Item::Pragma(n) => walk_pragma(&mut s, n),
-                Item::Include(n) => walk_include(&mut s, n),
-                Item::TemplateDef(n) => {
-                    walk_template_def(&mut s, n);
-                    walk_block(&mut s, &n.body);
-                    for stmt in &n.body.stmts {
-                        walk_statement(&mut s, stmt);
-                        // Walk into specific statement types
-                        match &stmt.kind {
-                            StatementKind::VarDecl(n) => {
-                                walk_var_decl(&mut s, n);
-                                for e in &n.names {
-                                    walk_var_decl_entry(&mut s, e);
-                                }
-                            }
-                            StatementKind::SignalDecl(n) => {
-                                walk_signal_decl(&mut s, n);
-                                for e in &n.names {
-                                    walk_signal_decl_entry(&mut s, e);
-                                }
-                            }
-                            StatementKind::ComponentDecl(n) => {
-                                walk_component_decl(&mut s, n);
-                                for e in &n.names {
-                                    walk_component_decl_entry(&mut s, e);
-                                }
-                            }
-                            StatementKind::BusDecl(n) => {
-                                walk_bus_instance_decl(&mut s, n);
-                                walk_bus_type(&mut s, &n.bus_type);
-                            }
-                            StatementKind::Assignment(n) => walk_assign_stmt(&mut s, n),
-                            StatementKind::CompoundAssign(n) => {
-                                walk_compound_assign_stmt(&mut s, n)
-                            }
-                            StatementKind::ConstraintEq(n) => walk_constraint_eq_stmt(&mut s, n),
-                            StatementKind::TupleAssign(n) => walk_tuple_assign_stmt(&mut s, n),
-                            StatementKind::IfElse(n) => walk_if_else(&mut s, n),
-                            StatementKind::For(n) => walk_for_loop(&mut s, n),
-                            StatementKind::While(n) => walk_while_loop(&mut s, n),
-                            StatementKind::Log(n) => {
-                                walk_log_stmt(&mut s, n);
-                                for arg in &n.args {
-                                    walk_log_arg(&mut s, arg);
-                                }
-                            }
-                            StatementKind::Assert(n) => walk_assert_stmt(&mut s, n),
-                            StatementKind::Return(n) => walk_return_stmt(&mut s, n),
-                            StatementKind::Increment(e)
-                            | StatementKind::Decrement(e)
-                            | StatementKind::Expression(e) => walk_expression(&mut s, e),
-                            StatementKind::Block(blk) => walk_block(&mut s, blk),
-                            StatementKind::Error => {}
-                        }
-                    }
-                }
-                Item::FunctionDef(n) => {
-                    walk_function_def(&mut s, n);
-                    for stmt in &n.body.stmts {
-                        walk_statement(&mut s, stmt);
-                        if let StatementKind::Return(r) = &stmt.kind {
-                            walk_return_stmt(&mut s, r);
-                        }
-                    }
-                }
-                Item::BusDef(n) => {
-                    walk_bus_def(&mut s, n);
-                    for member in &n.body {
-                        walk_bus_member(&mut s, member);
-                        if let BusMember::Bus(f) = member {
-                            walk_bus_field_decl(&mut s, f);
-                        }
-                    }
-                }
-                Item::MainComponent(n) => walk_main_component(&mut s, n),
-            }
+            skip_all_walk_item(&mut s, item);
         }
 
         // Walk anonymous comp and its inputs
-        for item in &file.items {
-            if let Item::TemplateDef(t) = item {
-                for stmt in &t.body.stmts {
-                    if let StatementKind::Assignment(a) = &stmt.kind {
-                        if let ExpressionKind::AnonymousComp(comp) = a.rhs.kind.as_ref() {
-                            let mut s = SkipAllWalker;
-                            walk_anonymous_comp(&mut s, comp);
-                            for input in &comp.inputs {
-                                walk_anon_comp_input(&mut s, input);
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        skip_all_walk_anon_comps(&file);
 
         // Walk identifiers
         for item in &file.items {
@@ -1326,6 +1345,41 @@ mod tests {
         assert_eq!(tracker.depth, 0); // balanced
     }
 
+    struct BusWalker {
+        events: Vec<Event>,
+    }
+
+    impl Walker for BusWalker {
+        fn enter_bus_def(&mut self, _: &BusDef) -> bool {
+            self.events.push(Event::Enter("BusDef"));
+            true
+        }
+        fn leave_bus_def(&mut self, _: &BusDef) {
+            self.events.push(Event::Leave("BusDef"));
+        }
+        fn enter_bus_member(&mut self, _: &BusMember) -> bool {
+            self.events.push(Event::Enter("BusMember"));
+            true
+        }
+        fn leave_bus_member(&mut self, _: &BusMember) {
+            self.events.push(Event::Leave("BusMember"));
+        }
+        fn enter_signal_decl(&mut self, _: &SignalDecl) -> bool {
+            self.events.push(Event::Enter("SignalDecl"));
+            true
+        }
+        fn leave_signal_decl(&mut self, _: &SignalDecl) {
+            self.events.push(Event::Leave("SignalDecl"));
+        }
+        fn enter_identifier(&mut self, _: &Identifier) -> bool {
+            self.events.push(Event::Enter("Identifier"));
+            true
+        }
+        fn leave_identifier(&mut self, _: &Identifier) {
+            self.events.push(Event::Leave("Identifier"));
+        }
+    }
+
     #[test]
     fn walker_visits_bus_def() {
         let src = r#"
@@ -1336,41 +1390,6 @@ mod tests {
         "#;
         let (file, errors) = parser::parse(src);
         assert!(errors.is_empty(), "parse errors: {errors:?}");
-
-        struct BusWalker {
-            events: Vec<Event>,
-        }
-
-        impl Walker for BusWalker {
-            fn enter_bus_def(&mut self, _: &BusDef) -> bool {
-                self.events.push(Event::Enter("BusDef"));
-                true
-            }
-            fn leave_bus_def(&mut self, _: &BusDef) {
-                self.events.push(Event::Leave("BusDef"));
-            }
-            fn enter_bus_member(&mut self, _: &BusMember) -> bool {
-                self.events.push(Event::Enter("BusMember"));
-                true
-            }
-            fn leave_bus_member(&mut self, _: &BusMember) {
-                self.events.push(Event::Leave("BusMember"));
-            }
-            fn enter_signal_decl(&mut self, _: &SignalDecl) -> bool {
-                self.events.push(Event::Enter("SignalDecl"));
-                true
-            }
-            fn leave_signal_decl(&mut self, _: &SignalDecl) {
-                self.events.push(Event::Leave("SignalDecl"));
-            }
-            fn enter_identifier(&mut self, _: &Identifier) -> bool {
-                self.events.push(Event::Enter("Identifier"));
-                true
-            }
-            fn leave_identifier(&mut self, _: &Identifier) {
-                self.events.push(Event::Leave("Identifier"));
-            }
-        }
 
         let mut w = BusWalker { events: vec![] };
         walk_file(&mut w, &file);

@@ -8,6 +8,83 @@ use crate::circomlib_docs;
 use crate::symbol::{ScopeId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 
+fn template_hover_markdown(name: &str, t: &crate::symbol::TemplateSymbol) -> String {
+    let params = t.params.join(", ");
+    let mut lines = vec![format!("```circom\ntemplate {name}({params})\n```")];
+    if t.is_parallel {
+        lines.push("**parallel**".to_string());
+    }
+    if t.is_custom {
+        lines.push("**custom**".to_string());
+    }
+    // If a user-defined template happens to share a name with a
+    // documented circomlib template, append the curated docs as well.
+    if let Some(entry) = circomlib_docs::lookup(name) {
+        lines.push("---".to_string());
+        lines.push(entry.markdown.to_string());
+    }
+    lines.join("\n\n")
+}
+
+fn signal_hover_markdown(name: &str, sig: &crate::symbol::SignalSymbol) -> String {
+    let direction = match sig.kind {
+        crate::ast::SignalKind::Input => "input ",
+        crate::ast::SignalKind::Output => "output ",
+        crate::ast::SignalKind::Intermediate => "",
+    };
+    let dims = if sig.dimensions > 0 {
+        "[]".repeat(sig.dimensions)
+    } else {
+        String::new()
+    };
+    let bus = sig
+        .bus_type
+        .as_ref()
+        .map(|b| format!(" bus {b}"))
+        .unwrap_or_default();
+    let tags = if sig.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" {{{}}}", sig.tags.join(", "))
+    };
+    format!("```circom\nsignal {direction}{name}{dims}{bus}{tags}\n```")
+}
+
+fn symbol_hover_markdown(symbol: &crate::symbol::Symbol) -> String {
+    match &symbol.kind {
+        SymbolKind::Template(t) => template_hover_markdown(&symbol.name, t),
+        SymbolKind::Function(f) => {
+            let params = f.params.join(", ");
+            format!("```circom\nfunction {}({})\n```", symbol.name, params)
+        }
+        SymbolKind::Bus(b) => {
+            let params = b.params.join(", ");
+            format!("```circom\nbus {}({})\n```", symbol.name, params)
+        }
+        SymbolKind::Signal(sig) => signal_hover_markdown(&symbol.name, sig),
+        SymbolKind::Variable => format!("```circom\nvar {}\n```", symbol.name),
+        SymbolKind::Component(comp) => {
+            let tmpl = comp
+                .template_name
+                .as_ref()
+                .map(|t| format!(": {t}"))
+                .unwrap_or_default();
+            format!("```circom\ncomponent {}{tmpl}\n```", symbol.name)
+        }
+        SymbolKind::Parameter => format!("```circom\nparameter {}\n```", symbol.name),
+    }
+}
+
+fn markdown_hover(value: String) -> Hover {
+    Hover {
+        contents: HoverContents::Markup(MarkupContent {
+            kind: MarkupKind::Markdown,
+            value,
+        }),
+        range: None,
+    }
+}
+
 /// Build hover information for the symbol with the given name at the given
 /// scope.
 pub fn hover_info(
@@ -25,96 +102,12 @@ pub fn hover_info(
             .map(|s| matches!(s.kind, SymbolKind::Template(_)))
             .unwrap_or(false);
         if !is_shadowing_template {
-            return Some(Hover {
-                contents: HoverContents::Markup(MarkupContent {
-                    kind: MarkupKind::Markdown,
-                    value: entry.markdown.to_string(),
-                }),
-                range: None,
-            });
+            return Some(markdown_hover(entry.markdown.to_string()));
         }
     }
 
     let symbol = local?;
-
-    let contents = match &symbol.kind {
-        SymbolKind::Template(t) => {
-            let params = t.params.join(", ");
-            let mut lines = vec![format!(
-                "```circom\ntemplate {}({})\n```",
-                symbol.name, params
-            )];
-            if t.is_parallel {
-                lines.push("**parallel**".to_string());
-            }
-            if t.is_custom {
-                lines.push("**custom**".to_string());
-            }
-            // If a user-defined template happens to share a name with a
-            // documented circomlib template, append the curated docs as well.
-            if let Some(entry) = circomlib_docs::lookup(&symbol.name) {
-                lines.push("---".to_string());
-                lines.push(entry.markdown.to_string());
-            }
-            lines.join("\n\n")
-        }
-        SymbolKind::Function(f) => {
-            let params = f.params.join(", ");
-            format!("```circom\nfunction {}({})\n```", symbol.name, params)
-        }
-        SymbolKind::Bus(b) => {
-            let params = b.params.join(", ");
-            format!("```circom\nbus {}({})\n```", symbol.name, params)
-        }
-        SymbolKind::Signal(sig) => {
-            let direction = match sig.kind {
-                crate::ast::SignalKind::Input => "input ",
-                crate::ast::SignalKind::Output => "output ",
-                crate::ast::SignalKind::Intermediate => "",
-            };
-            let dims = if sig.dimensions > 0 {
-                "[]".repeat(sig.dimensions)
-            } else {
-                String::new()
-            };
-            let bus = sig
-                .bus_type
-                .as_ref()
-                .map(|b| format!(" bus {b}"))
-                .unwrap_or_default();
-            let tags = if sig.tags.is_empty() {
-                String::new()
-            } else {
-                format!(" {{{}}}", sig.tags.join(", "))
-            };
-            format!(
-                "```circom\nsignal {direction}{}{dims}{bus}{tags}\n```",
-                symbol.name
-            )
-        }
-        SymbolKind::Variable => {
-            format!("```circom\nvar {}\n```", symbol.name)
-        }
-        SymbolKind::Component(comp) => {
-            let tmpl = comp
-                .template_name
-                .as_ref()
-                .map(|t| format!(": {t}"))
-                .unwrap_or_default();
-            format!("```circom\ncomponent {}{tmpl}\n```", symbol.name)
-        }
-        SymbolKind::Parameter => {
-            format!("```circom\nparameter {}\n```", symbol.name)
-        }
-    };
-
-    Some(Hover {
-        contents: HoverContents::Markup(MarkupContent {
-            kind: MarkupKind::Markdown,
-            value: contents,
-        }),
-        range: None,
-    })
+    Some(markdown_hover(symbol_hover_markdown(symbol)))
 }
 
 #[cfg(test)]

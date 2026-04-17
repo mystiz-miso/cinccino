@@ -204,218 +204,223 @@ impl<'a> SymbolVisitor<'a> {
         )
     }
 
-    fn collect_block_declarations(&mut self, block: &Block, out: &mut Vec<DocumentSymbol>) {
-        for stmt in &block.stmts {
-            match &stmt.kind {
-                StatementKind::VarDecl(v) => {
-                    for entry in &v.names {
-                        // Check if the var init is a component instantiation
-                        if let Some(ref init) = entry.init {
-                            if let Some(name) = extract_call_name(init) {
-                                out.push(self.make_symbol(
-                                    &entry.name.name,
-                                    Some(format!("component {name}")),
-                                    SymbolKind::OBJECT,
-                                    entry.name.span,
-                                    entry.name.span,
-                                    Vec::new(),
-                                ));
-                                continue;
-                            }
-                        }
-                        out.push(self.make_symbol(
-                            &entry.name.name,
-                            Some("var".to_string()),
-                            SymbolKind::VARIABLE,
-                            entry.name.span,
-                            entry.name.span,
-                            Vec::new(),
-                        ));
-                    }
-                }
-                StatementKind::SignalDecl(sig) => {
-                    // Check each signal: if init is a component instantiation,
-                    // emit as component; otherwise emit as signal. Either way,
-                    // walk the init for any *nested* calls (#259) so patterns
-                    // like `signal x <== Outer()(Inner()(in));` emit BOTH
-                    // `Outer` and `Inner` as call edges. Mirrors the
-                    // Assignment arm below.
-                    for entry in &sig.names {
-                        let mut emitted_top: Option<&str> = None;
-                        if let Some((_, ref init_expr)) = entry.init {
-                            if let Some(name) = extract_call_name(init_expr) {
-                                out.push(self.make_symbol(
-                                    &entry.name.name,
-                                    Some(format!("component {name}")),
-                                    SymbolKind::OBJECT,
-                                    entry.name.span,
-                                    entry.name.span,
-                                    Vec::new(),
-                                ));
-                                emitted_top = Some(name);
-                            }
-                            // Always walk nested calls — covers both the
-                            // outer-is-a-call case (skip the duplicate via
-                            // emitted_top) and the outer-is-not-a-call case
-                            // (e.g. `signal x <== a + Foo()(in);`).
-                            let mut nested = Vec::new();
-                            extract_all_call_names(init_expr, &mut nested);
-                            for nested_name in nested {
-                                if emitted_top == Some(nested_name) {
-                                    continue;
-                                }
-                                out.push(self.make_symbol(
-                                    nested_name,
-                                    Some(format!("component {nested_name}")),
-                                    SymbolKind::OBJECT,
-                                    stmt.span,
-                                    stmt.span,
-                                    Vec::new(),
-                                ));
-                            }
-                            if emitted_top.is_some() {
-                                continue;
-                            }
-                        }
-                        // Not a component — emit as signal
-                        let kind_str = match sig.kind {
-                            SignalKind::Input => "input",
-                            SignalKind::Output => "output",
-                            SignalKind::Intermediate => "intermediate",
-                        };
-                        let detail = if sig.tags.is_empty() {
-                            format!("signal {kind_str}")
-                        } else {
-                            let tags: Vec<&str> =
-                                sig.tags.iter().map(|t| t.name.as_str()).collect();
-                            format!("signal {kind_str} {{{}}}", tags.join(", "))
-                        };
-                        out.push(self.make_symbol(
-                            &entry.name.name,
-                            Some(detail),
-                            SymbolKind::FIELD,
-                            entry.name.span,
-                            entry.name.span,
-                            Vec::new(),
-                        ));
-                    }
-                }
-                StatementKind::ComponentDecl(c) => {
-                    for entry in &c.names {
-                        let detail = entry
-                            .init
-                            .as_ref()
-                            .and_then(|init| {
-                                // Try to extract template name from init expression
-                                extract_call_name(init).map(|name| format!("component {name}"))
-                            })
-                            .unwrap_or_else(|| "component".to_string());
-                        out.push(self.make_symbol(
-                            &entry.name.name,
-                            Some(detail),
-                            SymbolKind::OBJECT,
-                            entry.name.span,
-                            entry.name.span,
-                            Vec::new(),
-                        ));
-                    }
-                }
-                StatementKind::BusDecl(b) => {
+    fn collect_var_decl(&mut self, v: &VarDecl, out: &mut Vec<DocumentSymbol>) {
+        for entry in &v.names {
+            // Check if the var init is a component instantiation
+            if let Some(ref init) = entry.init {
+                if let Some(name) = extract_call_name(init) {
                     out.push(self.make_symbol(
-                        &b.name.name,
-                        Some(format!("bus {}", b.bus_type.name.name)),
-                        SymbolKind::FIELD,
-                        b.name.span,
-                        b.name.span,
+                        &entry.name.name,
+                        Some(format!("component {name}")),
+                        SymbolKind::OBJECT,
+                        entry.name.span,
+                        entry.name.span,
+                        Vec::new(),
+                    ));
+                    continue;
+                }
+            }
+            out.push(self.make_symbol(
+                &entry.name.name,
+                Some("var".to_string()),
+                SymbolKind::VARIABLE,
+                entry.name.span,
+                entry.name.span,
+                Vec::new(),
+            ));
+        }
+    }
+
+    fn signal_detail(&self, sig: &SignalDecl) -> String {
+        let kind_str = match sig.kind {
+            SignalKind::Input => "input",
+            SignalKind::Output => "output",
+            SignalKind::Intermediate => "intermediate",
+        };
+        if sig.tags.is_empty() {
+            format!("signal {kind_str}")
+        } else {
+            let tags: Vec<&str> = sig.tags.iter().map(|t| t.name.as_str()).collect();
+            format!("signal {kind_str} {{{}}}", tags.join(", "))
+        }
+    }
+
+    fn collect_signal_decl(
+        &mut self,
+        sig: &SignalDecl,
+        stmt: &Statement,
+        out: &mut Vec<DocumentSymbol>,
+    ) {
+        // Check each signal: if init is a component instantiation,
+        // emit as component; otherwise emit as signal. Either way,
+        // walk the init for any *nested* calls (#259) so patterns
+        // like `signal x <== Outer()(Inner()(in));` emit BOTH
+        // `Outer` and `Inner` as call edges. Mirrors the
+        // Assignment arm below.
+        for entry in &sig.names {
+            let mut emitted_top: Option<&str> = None;
+            if let Some((_, ref init_expr)) = entry.init {
+                if let Some(name) = extract_call_name(init_expr) {
+                    out.push(self.make_symbol(
+                        &entry.name.name,
+                        Some(format!("component {name}")),
+                        SymbolKind::OBJECT,
+                        entry.name.span,
+                        entry.name.span,
+                        Vec::new(),
+                    ));
+                    emitted_top = Some(name);
+                }
+                // Always walk nested calls — covers both the
+                // outer-is-a-call case (skip the duplicate via
+                // emitted_top) and the outer-is-not-a-call case
+                // (e.g. `signal x <== a + Foo()(in);`).
+                let mut nested = Vec::new();
+                extract_all_call_names(init_expr, &mut nested);
+                for nested_name in nested {
+                    if emitted_top == Some(nested_name) {
+                        continue;
+                    }
+                    out.push(self.make_symbol(
+                        nested_name,
+                        Some(format!("component {nested_name}")),
+                        SymbolKind::OBJECT,
+                        stmt.span,
+                        stmt.span,
                         Vec::new(),
                     ));
                 }
-                // Detect component instantiation in assignment statements:
-                // `comp = TemplateName(args)` or `comp[i] = TemplateName(args)`
-                StatementKind::Assignment(assign) => {
-                    if let Some(name) = extract_call_name(&assign.rhs) {
-                        let lhs_name = extract_lhs_name(&assign.lhs);
-                        out.push(self.make_symbol(
-                            &lhs_name,
-                            Some(format!("component {name}")),
-                            SymbolKind::OBJECT,
-                            stmt.span,
-                            stmt.span,
-                            Vec::new(),
-                        ));
-                    }
-                    // Also extract nested calls from the RHS
-                    let mut calls = Vec::new();
-                    extract_all_call_names(&assign.rhs, &mut calls);
-                    // Skip the first one if it was already emitted above
-                    let top_name = extract_call_name(&assign.rhs);
-                    for name in calls {
-                        if top_name == Some(name) {
-                            continue;
-                        }
-                        out.push(self.make_symbol(
-                            name,
-                            Some(format!("component {name}")),
-                            SymbolKind::OBJECT,
-                            stmt.span,
-                            stmt.span,
-                            Vec::new(),
-                        ));
-                    }
+                if emitted_top.is_some() {
+                    continue;
                 }
-                // Tuple assignment: `(a, b) <== Template(args)(inputs)`
+            }
+            let detail = self.signal_detail(sig);
+            out.push(self.make_symbol(
+                &entry.name.name,
+                Some(detail),
+                SymbolKind::FIELD,
+                entry.name.span,
+                entry.name.span,
+                Vec::new(),
+            ));
+        }
+    }
+
+    fn collect_component_decl(&mut self, c: &ComponentDecl, out: &mut Vec<DocumentSymbol>) {
+        for entry in &c.names {
+            let detail = entry
+                .init
+                .as_ref()
+                .and_then(|init| {
+                    // Try to extract template name from init expression
+                    extract_call_name(init).map(|name| format!("component {name}"))
+                })
+                .unwrap_or_else(|| "component".to_string());
+            out.push(self.make_symbol(
+                &entry.name.name,
+                Some(detail),
+                SymbolKind::OBJECT,
+                entry.name.span,
+                entry.name.span,
+                Vec::new(),
+            ));
+        }
+    }
+
+    fn collect_bus_decl(&mut self, b: &BusInstanceDecl, out: &mut Vec<DocumentSymbol>) {
+        out.push(self.make_symbol(
+            &b.name.name,
+            Some(format!("bus {}", b.bus_type.name.name)),
+            SymbolKind::FIELD,
+            b.name.span,
+            b.name.span,
+            Vec::new(),
+        ));
+    }
+
+    fn collect_assignment(
+        &mut self,
+        assign: &AssignStmt,
+        stmt: &Statement,
+        out: &mut Vec<DocumentSymbol>,
+    ) {
+        // Detect component instantiation in assignment statements:
+        // `comp = TemplateName(args)` or `comp[i] = TemplateName(args)`
+        if let Some(name) = extract_call_name(&assign.rhs) {
+            let lhs_name = extract_lhs_name(&assign.lhs);
+            out.push(self.make_symbol(
+                &lhs_name,
+                Some(format!("component {name}")),
+                SymbolKind::OBJECT,
+                stmt.span,
+                stmt.span,
+                Vec::new(),
+            ));
+        }
+        // Also extract nested calls from the RHS
+        let mut calls = Vec::new();
+        extract_all_call_names(&assign.rhs, &mut calls);
+        // Skip the first one if it was already emitted above
+        let top_name = extract_call_name(&assign.rhs);
+        for name in calls {
+            if top_name == Some(name) {
+                continue;
+            }
+            out.push(self.make_symbol(
+                name,
+                Some(format!("component {name}")),
+                SymbolKind::OBJECT,
+                stmt.span,
+                stmt.span,
+                Vec::new(),
+            ));
+        }
+    }
+
+    fn push_component_calls_from(
+        &mut self,
+        calls: &[&str],
+        stmt: &Statement,
+        out: &mut Vec<DocumentSymbol>,
+    ) {
+        for name in calls {
+            out.push(self.make_symbol(
+                name,
+                Some(format!("component {name}")),
+                SymbolKind::OBJECT,
+                stmt.span,
+                stmt.span,
+                Vec::new(),
+            ));
+        }
+    }
+
+    fn collect_block_declarations(&mut self, block: &Block, out: &mut Vec<DocumentSymbol>) {
+        for stmt in &block.stmts {
+            match &stmt.kind {
+                StatementKind::VarDecl(v) => self.collect_var_decl(v, out),
+                StatementKind::SignalDecl(sig) => self.collect_signal_decl(sig, stmt, out),
+                StatementKind::ComponentDecl(c) => self.collect_component_decl(c, out),
+                StatementKind::BusDecl(b) => self.collect_bus_decl(b, out),
+                StatementKind::Assignment(assign) => self.collect_assignment(assign, stmt, out),
                 StatementKind::TupleAssign(ta) => {
                     let mut calls = Vec::new();
                     extract_all_call_names(&ta.rhs, &mut calls);
-                    for name in calls {
-                        out.push(self.make_symbol(
-                            name,
-                            Some(format!("component {name}")),
-                            SymbolKind::OBJECT,
-                            stmt.span,
-                            stmt.span,
-                            Vec::new(),
-                        ));
-                    }
+                    self.push_component_calls_from(&calls, stmt, out);
                 }
-                // Constraint equality: `expr === expr`
                 StatementKind::ConstraintEq(ceq) => {
                     let mut calls = Vec::new();
                     extract_all_call_names(&ceq.lhs, &mut calls);
                     extract_all_call_names(&ceq.rhs, &mut calls);
-                    for name in calls {
-                        out.push(self.make_symbol(
-                            name,
-                            Some(format!("component {name}")),
-                            SymbolKind::OBJECT,
-                            stmt.span,
-                            stmt.span,
-                            Vec::new(),
-                        ));
-                    }
+                    self.push_component_calls_from(&calls, stmt, out);
                 }
-                // Bare expression statement: `Must()(IsNonZero()(x));`
                 StatementKind::Expression(expr) => {
                     let mut calls = Vec::new();
                     extract_all_call_names(expr, &mut calls);
-                    for name in calls {
-                        out.push(self.make_symbol(
-                            name,
-                            Some(format!("component {name}")),
-                            SymbolKind::OBJECT,
-                            stmt.span,
-                            stmt.span,
-                            Vec::new(),
-                        ));
-                    }
+                    self.push_component_calls_from(&calls, stmt, out);
                 }
-                // Recurse into control flow blocks to find nested assignments
-                StatementKind::For(f) => {
-                    self.collect_block_declarations(&f.body, out);
-                }
-                StatementKind::While(w) => {
-                    self.collect_block_declarations(&w.body, out);
-                }
+                StatementKind::For(f) => self.collect_block_declarations(&f.body, out),
+                StatementKind::While(w) => self.collect_block_declarations(&w.body, out),
                 StatementKind::IfElse(ie) => {
                     self.collect_block_declarations(&ie.then_body, out);
                     if let Some(ref else_body) = ie.else_body {
@@ -481,34 +486,42 @@ fn extract_call_name(expr: &Expression) -> Option<&str> {
     }
 }
 
+fn extract_calls_from_call<'a>(
+    callee: &'a Expression,
+    args: &'a [Expression],
+    out: &mut Vec<&'a str>,
+) {
+    if let ExpressionKind::Ident(name) = callee.kind.as_ref() {
+        out.push(name);
+    }
+    extract_all_call_names(callee, out);
+    for arg in args {
+        extract_all_call_names(arg, out);
+    }
+}
+
+fn extract_calls_from_anon<'a>(anon: &'a AnonymousComp, out: &mut Vec<&'a str>) {
+    if let ExpressionKind::Ident(name) = anon.template.kind.as_ref() {
+        out.push(name);
+    }
+    extract_all_call_names(&anon.template, out);
+    for input in &anon.inputs {
+        match input {
+            AnonCompInput::Positional(e) => extract_all_call_names(e, out),
+            AnonCompInput::Named(_, e) => extract_all_call_names(e, out),
+        }
+    }
+    for arg in &anon.template_args {
+        extract_all_call_names(arg, out);
+    }
+}
+
 /// Recursively extract ALL call/anonymous-component names from an expression tree.
 /// This catches nested calls like `Must()(IsNonZero()(x))`.
 fn extract_all_call_names<'a>(expr: &'a Expression, out: &mut Vec<&'a str>) {
     match expr.kind.as_ref() {
-        ExpressionKind::Call(callee, args) => {
-            if let ExpressionKind::Ident(name) = callee.kind.as_ref() {
-                out.push(name);
-            }
-            extract_all_call_names(callee, out);
-            for arg in args {
-                extract_all_call_names(arg, out);
-            }
-        }
-        ExpressionKind::AnonymousComp(anon) => {
-            if let ExpressionKind::Ident(name) = anon.template.kind.as_ref() {
-                out.push(name);
-            }
-            extract_all_call_names(&anon.template, out);
-            for input in &anon.inputs {
-                match input {
-                    AnonCompInput::Positional(e) => extract_all_call_names(e, out),
-                    AnonCompInput::Named(_, e) => extract_all_call_names(e, out),
-                }
-            }
-            for arg in &anon.template_args {
-                extract_all_call_names(arg, out);
-            }
-        }
+        ExpressionKind::Call(callee, args) => extract_calls_from_call(callee, args, out),
+        ExpressionKind::AnonymousComp(anon) => extract_calls_from_anon(anon, out),
         ExpressionKind::Binary(lhs, _, rhs) => {
             extract_all_call_names(lhs, out);
             extract_all_call_names(rhs, out);

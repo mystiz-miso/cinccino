@@ -883,7 +883,86 @@ impl<'a> UndeclaredChecker<'a> {
         }
     }
 
+    fn check_stmt_control_flow(&mut self, stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::For(f) => {
+                self.enter_child_scope();
+                self.check_statement(&f.init);
+                self.check_expr(&f.cond);
+                self.check_statement(&f.step);
+                self.check_block(&f.body);
+                self.leave_scope();
+                true
+            }
+            StatementKind::While(w) => {
+                self.enter_child_scope();
+                self.check_expr(&w.cond);
+                self.check_block(&w.body);
+                self.leave_scope();
+                true
+            }
+            StatementKind::IfElse(ie) => {
+                self.check_expr(&ie.cond);
+                self.enter_child_scope();
+                self.check_block(&ie.then_body);
+                self.leave_scope();
+                if let Some(eb) = &ie.else_body {
+                    self.enter_child_scope();
+                    self.check_block(eb);
+                    self.leave_scope();
+                }
+                true
+            }
+            StatementKind::Block(b) => {
+                self.enter_child_scope();
+                self.check_block(b);
+                self.leave_scope();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn check_stmt_decl(&mut self, stmt: &Statement) -> bool {
+        match &stmt.kind {
+            StatementKind::VarDecl(v) => {
+                for entry in &v.names {
+                    if let Some(init) = &entry.init {
+                        self.check_expr(init);
+                    }
+                }
+                true
+            }
+            StatementKind::SignalDecl(s) => {
+                for entry in &s.names {
+                    if let Some((_, init)) = &entry.init {
+                        self.check_expr(init);
+                    }
+                }
+                true
+            }
+            StatementKind::ComponentDecl(c) => {
+                for entry in &c.names {
+                    if let Some(init) = &entry.init {
+                        self.check_expr(init);
+                    }
+                }
+                true
+            }
+            StatementKind::BusDecl(b) => {
+                if let Some((_, init)) = &b.init {
+                    self.check_expr(init);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn check_statement(&mut self, stmt: &Statement) {
+        if self.check_stmt_control_flow(stmt) || self.check_stmt_decl(stmt) {
+            return;
+        }
         match &stmt.kind {
             StatementKind::Assignment(a) => {
                 self.check_expr(&a.lhs);
@@ -897,12 +976,8 @@ impl<'a> UndeclaredChecker<'a> {
                 self.check_expr(&c.lhs);
                 self.check_expr(&c.rhs);
             }
-            StatementKind::Return(r) => {
-                self.check_expr(&r.value);
-            }
-            StatementKind::Assert(a) => {
-                self.check_expr(&a.expr);
-            }
+            StatementKind::Return(r) => self.check_expr(&r.value),
+            StatementKind::Assert(a) => self.check_expr(&a.expr),
             StatementKind::Log(l) => {
                 for arg in &l.args {
                     if let LogArg::Expr(e) = arg {
@@ -910,94 +985,50 @@ impl<'a> UndeclaredChecker<'a> {
                     }
                 }
             }
-            StatementKind::Expression(e) => {
-                self.check_expr(e);
-            }
-            StatementKind::Increment(e) | StatementKind::Decrement(e) => {
-                self.check_expr(e);
-            }
-            StatementKind::VarDecl(v) => {
-                for entry in &v.names {
-                    if let Some(init) = &entry.init {
-                        self.check_expr(init);
-                    }
-                }
-            }
-            StatementKind::SignalDecl(s) => {
-                for entry in &s.names {
-                    if let Some((_, init)) = &entry.init {
-                        self.check_expr(init);
-                    }
-                }
-            }
-            StatementKind::ComponentDecl(c) => {
-                for entry in &c.names {
-                    if let Some(init) = &entry.init {
-                        self.check_expr(init);
-                    }
-                }
-            }
-            StatementKind::For(f) => {
-                self.enter_child_scope();
-                self.check_statement(&f.init);
-                self.check_expr(&f.cond);
-                self.check_statement(&f.step);
-                self.check_block(&f.body);
-                self.leave_scope();
-            }
-            StatementKind::While(w) => {
-                self.enter_child_scope();
-                self.check_expr(&w.cond);
-                self.check_block(&w.body);
-                self.leave_scope();
-            }
-            StatementKind::IfElse(ie) => {
-                self.check_expr(&ie.cond);
-                self.enter_child_scope();
-                self.check_block(&ie.then_body);
-                self.leave_scope();
-                if let Some(eb) = &ie.else_body {
-                    self.enter_child_scope();
-                    self.check_block(eb);
-                    self.leave_scope();
-                }
-            }
-            StatementKind::Block(b) => {
-                self.enter_child_scope();
-                self.check_block(b);
-                self.leave_scope();
-            }
+            StatementKind::Expression(e)
+            | StatementKind::Increment(e)
+            | StatementKind::Decrement(e) => self.check_expr(e),
             StatementKind::TupleAssign(t) => {
                 for e in t.targets.iter().flatten() {
                     self.check_expr(e);
                 }
                 self.check_expr(&t.rhs);
             }
-            StatementKind::BusDecl(b) => {
-                if let Some((_, init)) = &b.init {
-                    self.check_expr(init);
-                }
+            _ => {}
+        }
+    }
+
+    fn report_undeclared_ident(&mut self, name: &str, span: Span) {
+        if self
+            .table
+            .lookup_with_includes(self.current_scope, name, &self.file)
+            .is_none()
+        {
+            self.new_diagnostics.push(SymbolDiagnostic {
+                span,
+                message: format!("undeclared symbol '{name}'"),
+                kind: DiagnosticKind::UndeclaredSymbol,
+                file: self.file.clone(),
+            });
+        }
+    }
+
+    fn check_anon_comp(&mut self, ac: &AnonymousComp) {
+        self.check_expr(&ac.template);
+        for arg in &ac.template_args {
+            self.check_expr(arg);
+        }
+        for input in &ac.inputs {
+            match input {
+                AnonCompInput::Positional(e) => self.check_expr(e),
+                AnonCompInput::Named(_, e) => self.check_expr(e),
             }
-            StatementKind::Error => {}
         }
     }
 
     fn check_expr(&mut self, expr: &Expression) {
         match expr.kind.as_ref() {
-            ExpressionKind::Ident(name) => {
-                if self
-                    .table
-                    .lookup_with_includes(self.current_scope, name, &self.file)
-                    .is_none()
-                {
-                    self.new_diagnostics.push(SymbolDiagnostic {
-                        span: expr.span,
-                        message: format!("undeclared symbol '{name}'"),
-                        kind: DiagnosticKind::UndeclaredSymbol,
-                        file: self.file.clone(),
-                    });
-                }
-            }
+            ExpressionKind::Ident(name) => self.report_undeclared_ident(name, expr.span),
             ExpressionKind::Member(base, _field) => {
                 // For member access, we only check the base. Qualified resolution
                 // is a separate analysis pass.
@@ -1030,18 +1061,7 @@ impl<'a> UndeclaredChecker<'a> {
             }
             ExpressionKind::Paren(e) => self.check_expr(e),
             ExpressionKind::Parallel(e) => self.check_expr(e),
-            ExpressionKind::AnonymousComp(ac) => {
-                self.check_expr(&ac.template);
-                for arg in &ac.template_args {
-                    self.check_expr(arg);
-                }
-                for input in &ac.inputs {
-                    match input {
-                        AnonCompInput::Positional(e) => self.check_expr(e),
-                        AnonCompInput::Named(_, e) => self.check_expr(e),
-                    }
-                }
-            }
+            ExpressionKind::AnonymousComp(ac) => self.check_anon_comp(ac),
             ExpressionKind::Number(_) | ExpressionKind::Underscore | ExpressionKind::Error => {}
         }
     }

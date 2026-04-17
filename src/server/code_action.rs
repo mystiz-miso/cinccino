@@ -180,13 +180,10 @@ struct EnclosingContext {
 /// This is a lightweight lexical scan — it does not parse the document.
 /// It locates the most recent `template` or `function` keyword whose body
 /// brace pair contains `offset`.
-fn find_enclosing_context(text: &str, offset: usize) -> Option<EnclosingContext> {
-    let bytes = text.as_bytes();
-    let offset = offset.min(bytes.len());
-
-    // Walk backward to find an unmatched `{` — that's the body open brace.
+/// Walk backward from `offset` to find the unmatched `{` that opens the
+/// enclosing body. Returns the byte offset of that brace.
+fn find_enclosing_open_brace(bytes: &[u8], offset: usize) -> Option<usize> {
     let mut depth: i32 = 0;
-    let mut brace_pos: Option<usize> = None;
     let mut pos = offset;
     while pos > 0 {
         pos -= 1;
@@ -194,24 +191,19 @@ fn find_enclosing_context(text: &str, offset: usize) -> Option<EnclosingContext>
             b'}' => depth += 1,
             b'{' => {
                 if depth == 0 {
-                    brace_pos = Some(pos);
-                    break;
+                    return Some(pos);
                 }
                 depth -= 1;
             }
             _ => {}
         }
     }
-    let brace = brace_pos?;
+    None
+}
 
-    // From the brace, walk backward skipping whitespace and a possible
-    // `(...)` parameter list, then read the keyword.
-    let mut p = brace;
-    // Skip whitespace.
-    while p > 0 && bytes[p - 1].is_ascii_whitespace() {
-        p -= 1;
-    }
-    // Skip a `(...)` — walk backward with balanced parens.
+/// Skip back across a balanced `(...)` ending at position `p`. `p` is the
+/// index one past the closing `)`.
+fn skip_back_over_parens(bytes: &[u8], mut p: usize) -> usize {
     if p > 0 && bytes[p - 1] == b')' {
         let mut pdepth: i32 = 0;
         while p > 0 {
@@ -228,22 +220,42 @@ fn find_enclosing_context(text: &str, offset: usize) -> Option<EnclosingContext>
             }
         }
     }
-    // Skip whitespace + identifier (the template/function name).
+    p
+}
+
+fn skip_ws_back(bytes: &[u8], mut p: usize) -> usize {
     while p > 0 && bytes[p - 1].is_ascii_whitespace() {
         p -= 1;
     }
+    p
+}
+
+fn skip_ident_back(bytes: &[u8], mut p: usize) -> usize {
     while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'_') {
         p -= 1;
     }
+    p
+}
+
+fn find_enclosing_context(text: &str, offset: usize) -> Option<EnclosingContext> {
+    let bytes = text.as_bytes();
+    let offset = offset.min(bytes.len());
+
+    let brace = find_enclosing_open_brace(bytes, offset)?;
+
+    // From the brace, walk backward skipping whitespace and a possible
+    // `(...)` parameter list, then read the keyword.
+    let mut p = brace;
+    p = skip_ws_back(bytes, p);
+    p = skip_back_over_parens(bytes, p);
+    p = skip_ws_back(bytes, p);
+    p = skip_ident_back(bytes, p);
+
     // Skip whitespace + optional `custom`/`parallel` modifiers.
     loop {
-        while p > 0 && bytes[p - 1].is_ascii_whitespace() {
-            p -= 1;
-        }
+        p = skip_ws_back(bytes, p);
         let modifier_start = p;
-        while p > 0 && (bytes[p - 1].is_ascii_alphanumeric() || bytes[p - 1] == b'_') {
-            p -= 1;
-        }
+        p = skip_ident_back(bytes, p);
         if p == modifier_start {
             break;
         }
@@ -251,13 +263,11 @@ fn find_enclosing_context(text: &str, offset: usize) -> Option<EnclosingContext>
         if word == "custom" || word == "parallel" {
             continue;
         }
-        // The word we just read is the keyword — restore position and break.
         let kind = match word {
             "template" => EnclosingKind::Template,
             "function" => EnclosingKind::Function,
             _ => return None,
         };
-        // Insertion point: start of the line after the opening brace.
         let insert_offset = next_line_start(text, brace + 1);
         return Some(EnclosingContext {
             kind,

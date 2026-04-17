@@ -30,6 +30,88 @@ impl CinccinoBackend {
         }
     }
 
+    /// Resolve `(text, byte_offset, word)` for the identifier at `position`
+    /// in document `uri`, or `None` if any step fails.
+    fn resolve_word_at_position(
+        &self,
+        uri: &Url,
+        position: Position,
+    ) -> Option<(String, usize, String)> {
+        let text = self.documents.get_text(uri)?;
+        let offset = position_to_byte_offset(&text, position)?;
+        let word = word_at_offset(&text, offset);
+        if word.is_empty() {
+            return None;
+        }
+        Some((text, offset, word))
+    }
+
+    /// Index the current document and every other open document into a
+    /// fresh `SymbolTable`, returning the parsed AST of the current file.
+    fn build_cross_document_table(&self, uri: &Url, text: &str) -> (crate::ast::File, SymbolTable) {
+        let (ast, _) = parser::parse(text);
+        let file_path = uri.as_str();
+        let mut symbol_table = SymbolTable::new();
+        symbol_table.index_file(file_path, &ast);
+
+        for (doc_uri, doc_text) in self.documents.all_documents() {
+            if doc_uri != *uri {
+                let (doc_ast, _) = parser::parse(&doc_text);
+                symbol_table.index_file(doc_uri.as_str(), &doc_ast);
+            }
+        }
+        (ast, symbol_table)
+    }
+
+    /// Run semantic checks across all open documents and collect LSP diagnostics.
+    fn collect_semantic_diagnostics(
+        &self,
+        uri: &Url,
+        text: &str,
+        line_index: &LineIndex,
+    ) -> Vec<Diagnostic> {
+        let (ast, _) = parser::parse(text);
+        let file_path = uri.as_str();
+        let mut table = SymbolTable::new();
+        table.index_file(file_path, &ast);
+
+        // Also index other open documents for cross-file resolution.
+        for (doc_uri, doc_text) in self.documents.all_documents() {
+            if doc_uri != *uri {
+                let (doc_ast, _) = parser::parse(&doc_text);
+                table.index_file(doc_uri.as_str(), &doc_ast);
+            }
+        }
+
+        // Run type checker and constraint checker.
+        table.check_types(file_path, &ast);
+        table.check_constraints(file_path, &ast);
+        table.check_underconstrained(file_path, &ast);
+        table.check_undeclared(file_path, &ast);
+
+        // Convert semantic diagnostics to LSP diagnostics.
+        let mut out = Vec::new();
+        for diag in table.diagnostics() {
+            if diag.file != file_path {
+                continue;
+            }
+            let Some(start) = line_index.line_col(diag.span.start) else {
+                continue;
+            };
+            let Some(end) = line_index.line_col(diag.span.end) else {
+                continue;
+            };
+            out.push(Diagnostic {
+                range: lc_range(start, end),
+                severity: Some(severity_for(diag.kind)),
+                source: Some("cinccino".to_string()),
+                message: diag.message.clone(),
+                ..Default::default()
+            });
+        }
+        out
+    }
+
     /// Publish diagnostics from cached incremental parse errors plus
     /// semantic checks (type checker + constraint checker).
     async fn publish_diagnostics_cached(&self, uri: Url) {
@@ -43,16 +125,7 @@ impl CinccinoBackend {
                     let start = line_index.line_col(err.span.start)?;
                     let end = line_index.line_col(err.span.end)?;
                     Some(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: start.line,
-                                character: start.col,
-                            },
-                            end: Position {
-                                line: end.line,
-                                character: end.col,
-                            },
-                        },
+                        range: lc_range(start, end),
                         severity: Some(DiagnosticSeverity::ERROR),
                         source: Some("cinccino".to_string()),
                         message: err.message,
@@ -64,65 +137,7 @@ impl CinccinoBackend {
             // Run semantic checks only when there are no parse errors,
             // so the AST is well-formed.
             if diagnostics.is_empty() {
-                let (ast, _) = parser::parse(&text);
-                let file_path = uri.as_str();
-                let mut table = SymbolTable::new();
-                table.index_file(file_path, &ast);
-
-                // Also index other open documents for cross-file resolution.
-                for (doc_uri, doc_text) in self.documents.all_documents() {
-                    if doc_uri != uri {
-                        let (doc_ast, _) = parser::parse(&doc_text);
-                        table.index_file(doc_uri.as_str(), &doc_ast);
-                    }
-                }
-
-                // Run type checker and constraint checker.
-                table.check_types(file_path, &ast);
-                table.check_constraints(file_path, &ast);
-                table.check_underconstrained(file_path, &ast);
-                table.check_undeclared(file_path, &ast);
-
-                // Convert semantic diagnostics to LSP diagnostics.
-                for diag in table.diagnostics() {
-                    if diag.file != file_path {
-                        continue;
-                    }
-                    let start = match line_index.line_col(diag.span.start) {
-                        Some(lc) => lc,
-                        None => continue,
-                    };
-                    let end = match line_index.line_col(diag.span.end) {
-                        Some(lc) => lc,
-                        None => continue,
-                    };
-
-                    let severity = match diag.kind {
-                        DiagnosticKind::UnsafeSignalAssignment
-                        | DiagnosticKind::TagLoss
-                        | DiagnosticKind::UnusedComponentOutput
-                        | DiagnosticKind::MissingComponentInput
-                        | DiagnosticKind::UnderconstrainedOutput => DiagnosticSeverity::WARNING,
-                        _ => DiagnosticSeverity::ERROR,
-                    };
-
-                    diagnostics.push(Diagnostic {
-                        range: Range {
-                            start: Position {
-                                line: start.line,
-                                character: start.col,
-                            },
-                            end: Position {
-                                line: end.line,
-                                character: end.col,
-                            },
-                        },
-                        severity: Some(severity),
-                        source: Some("cinccino".to_string()),
-                        message: diag.message.clone(),
-                        ..Default::default()
-                    });
-                }
+                diagnostics.extend(self.collect_semantic_diagnostics(&uri, &text, &line_index));
             }
 
             self.client
@@ -132,47 +147,35 @@ impl CinccinoBackend {
     }
 }
 
+fn lc_range(start: LineCol, end: LineCol) -> Range {
+    Range {
+        start: Position {
+            line: start.line,
+            character: start.col,
+        },
+        end: Position {
+            line: end.line,
+            character: end.col,
+        },
+    }
+}
+
+fn severity_for(kind: DiagnosticKind) -> DiagnosticSeverity {
+    match kind {
+        DiagnosticKind::UnsafeSignalAssignment
+        | DiagnosticKind::TagLoss
+        | DiagnosticKind::UnusedComponentOutput
+        | DiagnosticKind::MissingComponentInput
+        | DiagnosticKind::UnderconstrainedOutput => DiagnosticSeverity::WARNING,
+        _ => DiagnosticSeverity::ERROR,
+    }
+}
+
 #[tower_lsp::async_trait]
 impl LanguageServer for CinccinoBackend {
     async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
         Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Options(
-                    TextDocumentSyncOptions {
-                        open_close: Some(true),
-                        change: Some(TextDocumentSyncKind::INCREMENTAL),
-                        save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
-                            include_text: Some(true),
-                        })),
-                        ..Default::default()
-                    },
-                )),
-                completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string(), "\"".to_string()]),
-                    resolve_provider: Some(false),
-                    ..Default::default()
-                }),
-                definition_provider: Some(OneOf::Left(true)),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                references_provider: Some(OneOf::Left(true)),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-                    retrigger_characters: Some(vec![",".to_string()]),
-                    work_done_progress_options: Default::default(),
-                }),
-                rename_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
-                document_formatting_provider: Some(OneOf::Left(true)),
-                workspace: Some(WorkspaceServerCapabilities {
-                    workspace_folders: Some(WorkspaceFoldersServerCapabilities {
-                        supported: Some(true),
-                        change_notifications: Some(OneOf::Left(true)),
-                    }),
-                    file_operations: None,
-                }),
-                ..Default::default()
-            },
+            capabilities: server_capabilities(),
             server_info: Some(ServerInfo {
                 name: "cinccino".to_string(),
                 version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -334,20 +337,8 @@ impl LanguageServer for CinccinoBackend {
             return Ok(None);
         }
 
-        // Parse and build symbol table
-        let (ast, _) = parser::parse(&text);
-        let mut symbol_table = SymbolTable::new();
+        let (ast, symbol_table) = self.build_cross_document_table(&uri, &text);
         let file_path = uri.as_str();
-        symbol_table.index_file(file_path, &ast);
-
-        // Also index all other open documents for cross-file resolution
-        for (doc_uri, doc_text) in self.documents.all_documents() {
-            if doc_uri != uri {
-                let doc_path = doc_uri.as_str();
-                let (doc_ast, _) = parser::parse(&doc_text);
-                symbol_table.index_file(doc_path, &doc_ast);
-            }
-        }
 
         // Find the scope at the cursor position for correct resolution.
         let scope = completion::find_scope_at_offset_ast(&ast, offset, &symbol_table, file_path);
@@ -370,20 +361,9 @@ impl LanguageServer for CinccinoBackend {
                 .unwrap_or(LineCol { line: 0, col: 0 });
             let end = target_line_index.line_col(symbol.span.end).unwrap_or(start);
 
-            let range = Range {
-                start: Position {
-                    line: start.line,
-                    character: start.col,
-                },
-                end: Position {
-                    line: end.line,
-                    character: end.col,
-                },
-            };
-
             return Ok(Some(GotoDefinitionResponse::Scalar(Location {
                 uri: target_uri,
-                range,
+                range: lc_range(start, end),
             })));
         }
 
@@ -431,109 +411,45 @@ impl LanguageServer for CinccinoBackend {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
 
-        let text = match self.documents.get_text(&uri) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        let offset = match position_to_byte_offset(&text, position) {
-            Some(o) => o,
-            None => return Ok(None),
-        };
-
-        let word = word_at_offset(&text, offset);
-        if word.is_empty() {
+        let Some((text, offset, word)) = self.resolve_word_at_position(&uri, position) else {
             return Ok(None);
-        }
+        };
 
-        // Collect all open documents.
         let all_docs = self.documents.all_documents();
-
-        // Parse all documents and build a combined symbol table.
-        let (ast, _) = parser::parse(&text);
+        let (ast, symbol_table) = self.build_cross_document_table(&uri, &text);
         let file_path = uri.as_str();
-        let mut symbol_table = SymbolTable::new();
-        symbol_table.index_file(file_path, &ast);
 
-        for (doc_uri, doc_text) in &all_docs {
-            if *doc_uri != uri {
-                let (doc_ast, _) = parser::parse(doc_text);
-                symbol_table.index_file(doc_uri.as_str(), &doc_ast);
-            }
-        }
-
-        // Resolve the symbol at cursor to get its definition.
         let scope = completion::find_scope_at_offset_ast(&ast, offset, &symbol_table, file_path);
 
-        let target_symbol = symbol_table.lookup_with_includes(scope, &word, file_path);
-
-        if target_symbol.is_none() {
+        let Some(target_symbol) = symbol_table.lookup_with_includes(scope, &word, file_path) else {
             return Ok(None);
-        }
-        let target_name = target_symbol.unwrap().name.clone();
-
+        };
+        let target_name = target_symbol.name.clone();
+        let def_file = target_symbol.file.clone();
+        let def_start = target_symbol.span.start;
         let include_declaration = params.context.include_declaration;
 
-        // Find all occurrences of the identifier across open documents.
         let mut locations = Vec::new();
-
-        // Helper: scan source text for all occurrences of the identifier.
-        let mut scan_text = |doc_uri: &Url, doc_text: &str| {
-            let line_index = LineIndex::new(doc_text);
-            let bytes = doc_text.as_bytes();
-            let name_bytes = target_name.as_bytes();
-            let name_len = name_bytes.len();
-
-            let mut pos = 0;
-            while pos + name_len <= bytes.len() {
-                if let Some(found) = doc_text[pos..].find(&target_name) {
-                    let abs_pos = pos + found;
-                    // Check word boundaries.
-                    let before_ok = abs_pos == 0 || !is_ident_byte(bytes[abs_pos - 1]);
-                    let after_ok = abs_pos + name_len >= bytes.len()
-                        || !is_ident_byte(bytes[abs_pos + name_len]);
-
-                    if before_ok && after_ok {
-                        // Skip the definition location if not including declarations.
-                        let is_definition = target_symbol
-                            .map(|s| s.file == doc_uri.as_str() && s.span.start == abs_pos)
-                            .unwrap_or(false);
-
-                        if include_declaration || !is_definition {
-                            if let (Some(start), Some(end)) = (
-                                line_index.line_col(abs_pos),
-                                line_index.line_col(abs_pos + name_len),
-                            ) {
-                                locations.push(Location {
-                                    uri: doc_uri.clone(),
-                                    range: Range {
-                                        start: Position {
-                                            line: start.line,
-                                            character: start.col,
-                                        },
-                                        end: Position {
-                                            line: end.line,
-                                            character: end.col,
-                                        },
-                                    },
-                                });
-                            }
-                        }
-                    }
-                    pos = abs_pos + name_len;
-                } else {
-                    break;
-                }
-            }
-        };
-
-        // Scan current document.
-        scan_text(&uri, &text);
-
-        // Scan other open documents.
+        scan_identifier_occurrences(
+            &uri,
+            &text,
+            &target_name,
+            &def_file,
+            def_start,
+            include_declaration,
+            &mut locations,
+        );
         for (doc_uri, doc_text) in &all_docs {
             if *doc_uri != uri {
-                scan_text(doc_uri, doc_text);
+                scan_identifier_occurrences(
+                    doc_uri,
+                    doc_text,
+                    &target_name,
+                    &def_file,
+                    def_start,
+                    include_declaration,
+                    &mut locations,
+                );
             }
         }
 
@@ -630,34 +546,13 @@ impl LanguageServer for CinccinoBackend {
             )));
         }
 
-        let text = match self.documents.get_text(&uri) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
-
-        let offset = match position_to_byte_offset(&text, position) {
-            Some(o) => o,
-            None => return Ok(None),
-        };
-
-        let word = word_at_offset(&text, offset);
-        if word.is_empty() {
+        let Some((text, offset, word)) = self.resolve_word_at_position(&uri, position) else {
             return Ok(None);
-        }
+        };
 
-        // Build the symbol table across all open documents.
-        let (ast, _) = parser::parse(&text);
-        let file_path = uri.as_str();
-        let mut table = SymbolTable::new();
-        table.index_file(file_path, &ast);
-
+        let (ast, table) = self.build_cross_document_table(&uri, &text);
         let all_docs = self.documents.all_documents();
-        for (doc_uri, doc_text) in &all_docs {
-            if *doc_uri != uri {
-                let (doc_ast, _) = parser::parse(doc_text);
-                table.index_file(doc_uri.as_str(), &doc_ast);
-            }
-        }
+        let file_path = uri.as_str();
 
         // Resolve the symbol under the cursor.
         let scope = completion::find_scope_at_offset_ast(&ast, offset, &table, file_path);
@@ -716,6 +611,92 @@ impl LanguageServer for CinccinoBackend {
             None => return Ok(None),
         };
         Ok(fmt_handler::format_document(&text, &params.options))
+    }
+}
+
+/// Scan `doc_text` for every word-boundary occurrence of `name` and push
+/// an LSP location for each into `locations`. When `include_declaration`
+/// is false, an occurrence at `(def_file, def_start)` is skipped.
+#[allow(clippy::too_many_arguments)]
+fn scan_identifier_occurrences(
+    doc_uri: &Url,
+    doc_text: &str,
+    name: &str,
+    def_file: &str,
+    def_start: usize,
+    include_declaration: bool,
+    locations: &mut Vec<Location>,
+) {
+    let line_index = LineIndex::new(doc_text);
+    let bytes = doc_text.as_bytes();
+    let name_len = name.len();
+
+    let mut pos = 0;
+    while pos + name_len <= bytes.len() {
+        let Some(found) = doc_text[pos..].find(name) else {
+            break;
+        };
+        let abs_pos = pos + found;
+        let before_ok = abs_pos == 0 || !is_ident_byte(bytes[abs_pos - 1]);
+        let after_ok =
+            abs_pos + name_len >= bytes.len() || !is_ident_byte(bytes[abs_pos + name_len]);
+
+        if before_ok && after_ok {
+            let is_definition = doc_uri.as_str() == def_file && abs_pos == def_start;
+            if include_declaration || !is_definition {
+                if let (Some(start), Some(end)) = (
+                    line_index.line_col(abs_pos),
+                    line_index.line_col(abs_pos + name_len),
+                ) {
+                    locations.push(Location {
+                        uri: doc_uri.clone(),
+                        range: lc_range(start, end),
+                    });
+                }
+            }
+        }
+        pos = abs_pos + name_len;
+    }
+}
+
+/// Build the static `ServerCapabilities` advertised by this LSP.
+fn server_capabilities() -> ServerCapabilities {
+    ServerCapabilities {
+        text_document_sync: Some(TextDocumentSyncCapability::Options(
+            TextDocumentSyncOptions {
+                open_close: Some(true),
+                change: Some(TextDocumentSyncKind::INCREMENTAL),
+                save: Some(TextDocumentSyncSaveOptions::SaveOptions(SaveOptions {
+                    include_text: Some(true),
+                })),
+                ..Default::default()
+            },
+        )),
+        completion_provider: Some(CompletionOptions {
+            trigger_characters: Some(vec![".".to_string(), "\"".to_string()]),
+            resolve_provider: Some(false),
+            ..Default::default()
+        }),
+        definition_provider: Some(OneOf::Left(true)),
+        hover_provider: Some(HoverProviderCapability::Simple(true)),
+        references_provider: Some(OneOf::Left(true)),
+        document_symbol_provider: Some(OneOf::Left(true)),
+        signature_help_provider: Some(SignatureHelpOptions {
+            trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+            retrigger_characters: Some(vec![",".to_string()]),
+            work_done_progress_options: Default::default(),
+        }),
+        rename_provider: Some(OneOf::Left(true)),
+        code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+        document_formatting_provider: Some(OneOf::Left(true)),
+        workspace: Some(WorkspaceServerCapabilities {
+            workspace_folders: Some(WorkspaceFoldersServerCapabilities {
+                supported: Some(true),
+                change_notifications: Some(OneOf::Left(true)),
+            }),
+            file_operations: None,
+        }),
+        ..Default::default()
     }
 }
 

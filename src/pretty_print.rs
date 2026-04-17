@@ -191,41 +191,36 @@ fn write_block(w: &mut IndentWriter, node: &Block) -> fmt::Result {
     w.write_str("}")
 }
 
+fn try_write_semi_stmt(w: &mut IndentWriter, node: &Statement) -> Option<fmt::Result> {
+    let res = match &node.kind {
+        StatementKind::VarDecl(n) => write_var_decl(w, n),
+        StatementKind::SignalDecl(n) => write_signal_decl(w, n),
+        StatementKind::ComponentDecl(n) => write_component_decl(w, n),
+        StatementKind::BusDecl(n) => write_bus_instance_decl(w, n),
+        StatementKind::Assignment(n) => write_assign_stmt(w, n),
+        StatementKind::CompoundAssign(n) => write_compound_assign_stmt(w, n),
+        StatementKind::ConstraintEq(n) => write_constraint_eq_stmt(w, n),
+        StatementKind::TupleAssign(n) => write_tuple_assign_stmt(w, n),
+        StatementKind::Return(n) => w
+            .write_str("return ")
+            .and_then(|()| write_expr(w, &n.value)),
+        StatementKind::Log(n) => write_log_stmt(w, n),
+        StatementKind::Assert(n) => w
+            .write_str("assert(")
+            .and_then(|()| write_expr(w, &n.expr))
+            .and_then(|()| w.write_str(")")),
+        StatementKind::Expression(expr) => write_expr(w, expr),
+        _ => return None,
+    };
+    Some(res.and_then(|()| w.write_str(";\n")))
+}
+
 fn write_statement(w: &mut IndentWriter, node: &Statement) -> fmt::Result {
     w.write_indent()?;
+    if let Some(res) = try_write_semi_stmt(w, node) {
+        return res;
+    }
     match &node.kind {
-        StatementKind::VarDecl(n) => {
-            write_var_decl(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::SignalDecl(n) => {
-            write_signal_decl(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::ComponentDecl(n) => {
-            write_component_decl(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::BusDecl(n) => {
-            write_bus_instance_decl(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::Assignment(n) => {
-            write_assign_stmt(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::CompoundAssign(n) => {
-            write_compound_assign_stmt(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::ConstraintEq(n) => {
-            write_constraint_eq_stmt(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::TupleAssign(n) => {
-            write_tuple_assign_stmt(w, n)?;
-            w.write_str(";\n")
-        }
         StatementKind::IfElse(n) => {
             write_if_else(w, n)?;
             w.write_str("\n")
@@ -238,20 +233,6 @@ fn write_statement(w: &mut IndentWriter, node: &Statement) -> fmt::Result {
             write_while_loop(w, n)?;
             w.write_str("\n")
         }
-        StatementKind::Return(n) => {
-            w.write_str("return ")?;
-            write_expr(w, &n.value)?;
-            w.write_str(";\n")
-        }
-        StatementKind::Log(n) => {
-            write_log_stmt(w, n)?;
-            w.write_str(";\n")
-        }
-        StatementKind::Assert(n) => {
-            w.write_str("assert(")?;
-            write_expr(w, &n.expr)?;
-            w.write_str(");\n")
-        }
         StatementKind::Increment(expr) => {
             write_expr(w, expr)?;
             w.write_str("++;\n")
@@ -260,15 +241,12 @@ fn write_statement(w: &mut IndentWriter, node: &Statement) -> fmt::Result {
             write_expr(w, expr)?;
             w.write_str("--;\n")
         }
-        StatementKind::Expression(expr) => {
-            write_expr(w, expr)?;
-            w.write_str(";\n")
-        }
         StatementKind::Block(blk) => {
             write_block(w, blk)?;
             w.write_str("\n")
         }
         StatementKind::Error => w.write_str("/* error */;\n"),
+        _ => Ok(()),
     }
 }
 
@@ -542,6 +520,54 @@ fn write_log_stmt(w: &mut IndentWriter, node: &LogStmt) -> fmt::Result {
 /// `Binary(Binary(a, Add, b), Mul, c)` prints as `a + b * c`, which
 /// re-parses as `a + (b * c)`, and `Unary(Neg, Unary(Neg, x))` prints
 /// as `--x`, which re-parses as a decrement).
+fn binary_op_pretty(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::Add => " + ",
+        BinaryOp::Sub => " - ",
+        BinaryOp::Mul => " * ",
+        BinaryOp::Div => " / ",
+        BinaryOp::IntDiv => " \\ ",
+        BinaryOp::Mod => " % ",
+        BinaryOp::Pow => " ** ",
+        BinaryOp::Shl => " << ",
+        BinaryOp::Shr => " >> ",
+        BinaryOp::BitAnd => " & ",
+        BinaryOp::BitOr => " | ",
+        BinaryOp::BitXor => " ^ ",
+        BinaryOp::And => " && ",
+        BinaryOp::Or => " || ",
+        BinaryOp::Eq => " == ",
+        BinaryOp::Ne => " != ",
+        BinaryOp::Lt => " < ",
+        BinaryOp::Gt => " > ",
+        BinaryOp::Le => " <= ",
+        BinaryOp::Ge => " >= ",
+    }
+}
+
+fn write_call_expr(w: &mut IndentWriter, callee: &Expression, args: &[Expression]) -> fmt::Result {
+    write_expr(w, callee)?;
+    w.write_str("(")?;
+    for (i, arg) in args.iter().enumerate() {
+        if i > 0 {
+            w.write_str(", ")?;
+        }
+        write_expr(w, arg)?;
+    }
+    w.write_str(")")
+}
+
+fn write_array_lit(w: &mut IndentWriter, elems: &[Expression]) -> fmt::Result {
+    w.write_str("[")?;
+    for (i, elem) in elems.iter().enumerate() {
+        if i > 0 {
+            w.write_str(", ")?;
+        }
+        write_expr(w, elem)?;
+    }
+    w.write_str("]")
+}
+
 fn write_expr(w: &mut IndentWriter, node: &Expression) -> fmt::Result {
     match node.kind.as_ref() {
         ExpressionKind::Number(n) => w.write_str(n),
@@ -556,29 +582,7 @@ fn write_expr(w: &mut IndentWriter, node: &Expression) -> fmt::Result {
         }
         ExpressionKind::Binary(lhs, op, rhs) => {
             write_expr(w, lhs)?;
-            let op_str = match op {
-                BinaryOp::Add => " + ",
-                BinaryOp::Sub => " - ",
-                BinaryOp::Mul => " * ",
-                BinaryOp::Div => " / ",
-                BinaryOp::IntDiv => " \\ ",
-                BinaryOp::Mod => " % ",
-                BinaryOp::Pow => " ** ",
-                BinaryOp::Shl => " << ",
-                BinaryOp::Shr => " >> ",
-                BinaryOp::BitAnd => " & ",
-                BinaryOp::BitOr => " | ",
-                BinaryOp::BitXor => " ^ ",
-                BinaryOp::And => " && ",
-                BinaryOp::Or => " || ",
-                BinaryOp::Eq => " == ",
-                BinaryOp::Ne => " != ",
-                BinaryOp::Lt => " < ",
-                BinaryOp::Gt => " > ",
-                BinaryOp::Le => " <= ",
-                BinaryOp::Ge => " >= ",
-            };
-            w.write_str(op_str)?;
+            w.write_str(binary_op_pretty(*op))?;
             write_expr(w, rhs)
         }
         ExpressionKind::Ternary(cond, then_expr, else_expr) => {
@@ -598,28 +602,9 @@ fn write_expr(w: &mut IndentWriter, node: &Expression) -> fmt::Result {
             write_expr(w, expr)?;
             w.write_fmt(format_args!(".{}", ident.name))
         }
-        ExpressionKind::Call(callee, args) => {
-            write_expr(w, callee)?;
-            w.write_str("(")?;
-            for (i, arg) in args.iter().enumerate() {
-                if i > 0 {
-                    w.write_str(", ")?;
-                }
-                write_expr(w, arg)?;
-            }
-            w.write_str(")")
-        }
+        ExpressionKind::Call(callee, args) => write_call_expr(w, callee, args),
         ExpressionKind::AnonymousComp(comp) => write_anonymous_comp(w, comp),
-        ExpressionKind::ArrayLit(elems) => {
-            w.write_str("[")?;
-            for (i, elem) in elems.iter().enumerate() {
-                if i > 0 {
-                    w.write_str(", ")?;
-                }
-                write_expr(w, elem)?;
-            }
-            w.write_str("]")
-        }
+        ExpressionKind::ArrayLit(elems) => write_array_lit(w, elems),
         ExpressionKind::Paren(expr) => {
             w.write_str("(")?;
             write_expr(w, expr)?;
@@ -996,9 +981,7 @@ template Num2Bits(n) {
         assert!(output.contains("A(n)(x <== in1, y <== in2)"));
     }
 
-    #[test]
-    fn pretty_print_all_expression_kinds() {
-        let src = r#"template T() {
+    const ALL_EXPRESSION_KINDS_SRC: &str = r#"template T() {
     var x = -1;
     var y = !x;
     var z = ~x;
@@ -1032,7 +1015,10 @@ template Num2Bits(n) {
     out <== parallel x;
 }
 "#;
-        let (file, errors) = parser::parse(src);
+
+    #[test]
+    fn pretty_print_all_expression_kinds() {
+        let (file, errors) = parser::parse(ALL_EXPRESSION_KINDS_SRC);
         assert!(errors.is_empty(), "parse errors: {errors:?}");
         let output = file.to_string();
         // Verify key operators are present

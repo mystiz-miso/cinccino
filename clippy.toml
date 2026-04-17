@@ -1,0 +1,10 @@
+# Mirror the Go / TS / Python complexity gates elsewhere in the repo.
+# - Go (golangci-lint): cyclop 10, funlen 50 / 40, gocognit 20
+# - TS (ESLint): complexity 10, max-lines-per-function 50
+# - Python (ruff): C901 max-complexity 10, PLR0912/PLR0915 at 10/40
+#
+# Rust clippy's cognitive_complexity is the nearest equivalent to
+# gocognit; too_many_lines caps function body length. cognitive is
+# typically a couple points above cyclomatic, so 20 matches Go.
+cognitive-complexity-threshold = 20
+too-many-lines-threshold = 50

@@ -180,51 +180,58 @@ impl<'a> ConstraintChecker<'a> {
         }
     }
 
+    fn warn_unsafe_assignment(
+        &mut self,
+        target: &Expression,
+        constrained: &HashSet<String>,
+        span: Span,
+        op_str: &str,
+    ) {
+        if let Some(name) = target.extract_base_name() {
+            if !constrained.contains(&name) && self.is_signal(&name) {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span,
+                    message: format!(
+                        "signal '{name}' assigned with '{op_str}' without a corresponding '===' constraint"
+                    ),
+                    kind: DiagnosticKind::UnsafeSignalAssignment,
+                    file: self.file.clone(),
+                });
+            }
+        }
+    }
+
+    fn check_assignment_constraint(
+        &mut self,
+        a: &AssignStmt,
+        constrained: &HashSet<String>,
+        span: Span,
+    ) {
+        match a.op {
+            AssignOp::SafeLeft => {
+                // <== generates a constraint: check quadratic form
+                self.check_quadratic_constraint(&a.lhs, &a.rhs, span);
+            }
+            AssignOp::SafeRight => {
+                self.check_quadratic_constraint(&a.rhs, &a.lhs, span);
+            }
+            AssignOp::UnsafeLeft => {
+                self.warn_unsafe_assignment(&a.lhs, constrained, span, "<--");
+            }
+            AssignOp::UnsafeRight => {
+                self.warn_unsafe_assignment(&a.rhs, constrained, span, "-->");
+            }
+            _ => {}
+        }
+    }
+
     fn check_stmt_constraints(&mut self, stmt: &Statement, constrained: &HashSet<String>) {
         match &stmt.kind {
             StatementKind::ConstraintEq(c) => {
                 self.check_quadratic_constraint(&c.lhs, &c.rhs, stmt.span);
             }
             StatementKind::Assignment(a) => {
-                match a.op {
-                    AssignOp::SafeLeft => {
-                        // <== generates a constraint: check quadratic form
-                        self.check_quadratic_constraint(&a.lhs, &a.rhs, stmt.span);
-                    }
-                    AssignOp::SafeRight => {
-                        self.check_quadratic_constraint(&a.rhs, &a.lhs, stmt.span);
-                    }
-                    AssignOp::UnsafeLeft => {
-                        // <-- without === is a warning
-                        if let Some(name) = a.lhs.extract_base_name() {
-                            if !constrained.contains(&name) && self.is_signal(&name) {
-                                self.diagnostics.push(SymbolDiagnostic {
-                                    span: stmt.span,
-                                    message: format!(
-                                        "signal '{name}' assigned with '<--' without a corresponding '===' constraint"
-                                    ),
-                                    kind: DiagnosticKind::UnsafeSignalAssignment,
-                                    file: self.file.clone(),
-                                });
-                            }
-                        }
-                    }
-                    AssignOp::UnsafeRight => {
-                        if let Some(name) = a.rhs.extract_base_name() {
-                            if !constrained.contains(&name) && self.is_signal(&name) {
-                                self.diagnostics.push(SymbolDiagnostic {
-                                    span: stmt.span,
-                                    message: format!(
-                                        "signal '{name}' assigned with '-->' without a corresponding '===' constraint"
-                                    ),
-                                    kind: DiagnosticKind::UnsafeSignalAssignment,
-                                    file: self.file.clone(),
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+                self.check_assignment_constraint(a, constrained, stmt.span);
             }
             StatementKind::For(f) => {
                 self.check_block_constraints(&f.body, constrained);
@@ -266,6 +273,64 @@ impl<'a> ConstraintChecker<'a> {
         }
     }
 
+    fn pow_degree(&self, ld: Degree, r: &Expression, rd: Degree) -> Degree {
+        // signal ** constant: degree = signal_degree * constant_value
+        // For simplicity, if LHS is a signal and RHS is constant,
+        // we conservatively check: if LHS has signals and RHS > 2, non-quadratic.
+        if ld > Degree::Constant && rd == Degree::Constant {
+            // If exponent is a known number, compute degree
+            if let ExpressionKind::Number(n) = r.kind.as_ref() {
+                if let Ok(exp) = n.parse::<u32>() {
+                    return Degree::from_u32(ld.as_u32().saturating_mul(exp));
+                }
+            }
+            // Unknown exponent with signal base — assume non-quadratic
+            Degree::NonQuadratic
+        } else if ld > Degree::Constant && rd > Degree::Constant {
+            Degree::NonQuadratic
+        } else {
+            ld.combined(rd)
+        }
+    }
+
+    fn binary_degree(&self, l: &Expression, op: BinaryOp, r: &Expression) -> Degree {
+        let ld = self.expr_degree(l);
+        let rd = self.expr_degree(r);
+        match op {
+            BinaryOp::Mul => ld.mul(rd),
+            BinaryOp::Pow => self.pow_degree(ld, r, rd),
+            BinaryOp::Add | BinaryOp::Sub => ld.combined(rd),
+            BinaryOp::Div | BinaryOp::IntDiv | BinaryOp::Mod => {
+                // Division by a signal is non-linear
+                if rd > Degree::Constant {
+                    Degree::NonQuadratic
+                } else {
+                    ld
+                }
+            }
+            // Comparison and logical ops produce constants
+            BinaryOp::Eq
+            | BinaryOp::Ne
+            | BinaryOp::Lt
+            | BinaryOp::Gt
+            | BinaryOp::Le
+            | BinaryOp::Ge
+            | BinaryOp::And
+            | BinaryOp::Or
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::Shl
+            | BinaryOp::Shr => {
+                if ld > Degree::Constant || rd > Degree::Constant {
+                    Degree::NonQuadratic
+                } else {
+                    Degree::Constant
+                }
+            }
+        }
+    }
+
     /// Compute the signal degree of an expression.
     fn expr_degree(&self, expr: &Expression) -> Degree {
         match expr.kind.as_ref() {
@@ -278,69 +343,7 @@ impl<'a> ConstraintChecker<'a> {
                 }
             }
             ExpressionKind::Unary(_, e) => self.expr_degree(e),
-            ExpressionKind::Binary(l, op, r) => {
-                let ld = self.expr_degree(l);
-                let rd = self.expr_degree(r);
-                match op {
-                    BinaryOp::Mul => ld.mul(rd),
-                    BinaryOp::Pow => {
-                        // signal ** constant: degree = signal_degree * constant_value
-                        // For simplicity, if LHS is a signal and RHS is constant,
-                        // we conservatively check: if LHS has signals and RHS > 2, non-quadratic.
-                        if ld > Degree::Constant && rd == Degree::Constant {
-                            // If exponent is a known number, compute degree
-                            if let ExpressionKind::Number(n) = r.kind.as_ref() {
-                                if let Ok(exp) = n.parse::<u32>() {
-                                    return Degree::from_u32(ld.as_u32().saturating_mul(exp));
-                                }
-                            }
-                            // Unknown exponent with signal base — assume non-quadratic
-                            Degree::NonQuadratic
-                        } else if ld > Degree::Constant && rd > Degree::Constant {
-                            Degree::NonQuadratic
-                        } else {
-                            ld.combined(rd)
-                        }
-                    }
-                    BinaryOp::Add | BinaryOp::Sub => ld.combined(rd),
-                    BinaryOp::Div | BinaryOp::IntDiv | BinaryOp::Mod => {
-                        // Division by a signal is non-linear
-                        if rd > Degree::Constant {
-                            Degree::NonQuadratic
-                        } else {
-                            ld
-                        }
-                    }
-                    // Comparison and logical ops produce constants
-                    BinaryOp::Eq
-                    | BinaryOp::Ne
-                    | BinaryOp::Lt
-                    | BinaryOp::Gt
-                    | BinaryOp::Le
-                    | BinaryOp::Ge
-                    | BinaryOp::And
-                    | BinaryOp::Or => {
-                        // These produce boolean results — treat as non-linear if inputs have signals
-                        if ld > Degree::Constant || rd > Degree::Constant {
-                            Degree::NonQuadratic
-                        } else {
-                            Degree::Constant
-                        }
-                    }
-                    // Bitwise ops are non-linear for signals
-                    BinaryOp::BitAnd
-                    | BinaryOp::BitOr
-                    | BinaryOp::BitXor
-                    | BinaryOp::Shl
-                    | BinaryOp::Shr => {
-                        if ld > Degree::Constant || rd > Degree::Constant {
-                            Degree::NonQuadratic
-                        } else {
-                            Degree::Constant
-                        }
-                    }
-                }
-            }
+            ExpressionKind::Binary(l, op, r) => self.binary_degree(l, *op, r),
             ExpressionKind::Ternary(cond, then_expr, else_expr) => {
                 let cd = self.expr_degree(cond);
                 let td = self.expr_degree(then_expr);

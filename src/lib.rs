@@ -1,3 +1,9 @@
+// Enforce the repo-wide complexity gates: every function must be
+// under 50 lines AND have cognitive complexity ≤ 20, matching the
+// Go / TS / Python thresholds. Thresholds live in clippy.toml.
+#![warn(clippy::too_many_lines)]
+#![warn(clippy::cognitive_complexity)]
+
 pub mod ast;
 pub mod circomlib_docs;
 pub mod constraint_checker;

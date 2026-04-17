@@ -84,6 +84,130 @@ impl<'a> TypeChecker<'a> {
     ///   template (otherwise the user has a typo).
     /// - Any declared output signal on an instantiated component that is
     ///   never read is flagged as an unused output (warning).
+    fn template_signal_info(&self, tmpl_body: ScopeId) -> TemplateSignalInfo {
+        let tmpl_scope = self.table.scopes.get(tmpl_body);
+        let mut info = TemplateSignalInfo::default();
+        for sid in tmpl_scope.all_symbols() {
+            let s = self.table.get_symbol(sid);
+            if let SymbolKind::Signal(sig) = &s.kind {
+                info.known.insert(s.name.clone());
+                match sig.kind {
+                    SignalKind::Output => info.outputs.push((s.name.clone(), s.span)),
+                    SignalKind::Input => info.inputs.push((s.name.clone(), s.span)),
+                    SignalKind::Intermediate => {}
+                }
+            }
+        }
+        info
+    }
+
+    fn warn_unknown_component_accesses(
+        &mut self,
+        cname: &str,
+        template_name: &str,
+        known: &HashSet<String>,
+        access: &ComponentAccess,
+    ) {
+        for (field, span) in access
+            .reads
+            .get(cname)
+            .into_iter()
+            .flatten()
+            .chain(access.writes.get(cname).into_iter().flatten())
+        {
+            if !known.contains(field) {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: *span,
+                    message: format!(
+                        "template '{template_name}' has no signal '{field}' (component '{cname}')"
+                    ),
+                    kind: DiagnosticKind::UnknownComponentSignal,
+                    file: self.file.clone(),
+                });
+            }
+        }
+    }
+
+    fn warn_unused_outputs(
+        &mut self,
+        cname: &str,
+        info: &ComponentInfo,
+        outputs: &[(String, Span)],
+        access: &ComponentAccess,
+    ) {
+        let reads_for_c: HashSet<&str> = access
+            .reads
+            .get(cname)
+            .into_iter()
+            .flatten()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        for (name, _) in outputs {
+            if !reads_for_c.contains(name.as_str()) {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: info.decl_span,
+                    message: format!("output '{name}' of component '{cname}' is never read"),
+                    kind: DiagnosticKind::UnusedComponentOutput,
+                    file: self.file.clone(),
+                });
+            }
+        }
+    }
+
+    fn warn_missing_inputs(
+        &mut self,
+        cname: &str,
+        info: &ComponentInfo,
+        inputs: &[(String, Span)],
+        access: &ComponentAccess,
+    ) {
+        let writes_for_c: HashSet<&str> = access
+            .writes
+            .get(cname)
+            .into_iter()
+            .flatten()
+            .map(|(n, _)| n.as_str())
+            .collect();
+        for (name, _) in inputs {
+            if !writes_for_c.contains(name.as_str()) {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: info.decl_span,
+                    message: format!("input '{name}' of component '{cname}' is never assigned"),
+                    kind: DiagnosticKind::MissingComponentInput,
+                    file: self.file.clone(),
+                });
+            }
+        }
+    }
+
+    fn check_single_component(
+        &mut self,
+        cname: &str,
+        info: &ComponentInfo,
+        access: &ComponentAccess,
+    ) {
+        let Some(template_name) = info.template_name.as_ref() else {
+            return;
+        };
+        let tmpl_sym =
+            match self
+                .table
+                .lookup_with_includes(self.current_scope, template_name, &self.file)
+            {
+                Some(s) => s,
+                None => return,
+            };
+        let tmpl_body = match &tmpl_sym.kind {
+            SymbolKind::Template(t) => t.body_scope,
+            _ => return,
+        };
+
+        let sig_info = self.template_signal_info(tmpl_body);
+        self.warn_unknown_component_accesses(cname, template_name, &sig_info.known, access);
+        self.warn_unused_outputs(cname, info, &sig_info.outputs, access);
+        self.warn_missing_inputs(cname, info, &sig_info.inputs, access);
+    }
+
     fn check_component_instantiations(&mut self, body: &Block) {
         let mut components: HashMap<String, ComponentInfo> = HashMap::new();
         self.collect_components(body, &mut components);
@@ -98,100 +222,7 @@ impl<'a> TypeChecker<'a> {
         self.collect_component_accesses(body, &components, &mut access);
 
         for (cname, info) in &components {
-            let template_name = match &info.template_name {
-                Some(t) => t,
-                None => continue,
-            };
-            // Find the template symbol + its body scope.
-            let tmpl_sym =
-                match self
-                    .table
-                    .lookup_with_includes(self.current_scope, template_name, &self.file)
-                {
-                    Some(s) => s,
-                    None => continue,
-                };
-            let tmpl_body = match &tmpl_sym.kind {
-                SymbolKind::Template(t) => t.body_scope,
-                _ => continue,
-            };
-
-            // Inspect every direct signal declared in the template body.
-            let tmpl_scope = self.table.scopes.get(tmpl_body);
-            let mut outputs: Vec<(String, Span)> = Vec::new();
-            let mut inputs: Vec<(String, Span)> = Vec::new();
-            let mut known: HashSet<String> = HashSet::new();
-            for sid in tmpl_scope.all_symbols() {
-                let s = self.table.get_symbol(sid);
-                if let SymbolKind::Signal(sig) = &s.kind {
-                    known.insert(s.name.clone());
-                    match sig.kind {
-                        SignalKind::Output => outputs.push((s.name.clone(), s.span)),
-                        SignalKind::Input => inputs.push((s.name.clone(), s.span)),
-                        SignalKind::Intermediate => {}
-                    }
-                }
-            }
-
-            // Warn on unknown accesses (`c.foo` where `foo` isn't a signal).
-            for (field, span) in access
-                .reads
-                .get(cname)
-                .into_iter()
-                .flatten()
-                .chain(access.writes.get(cname).into_iter().flatten())
-            {
-                if !known.contains(field) {
-                    self.diagnostics.push(SymbolDiagnostic {
-                        span: *span,
-                        message: format!(
-                            "template '{template_name}' has no signal '{field}' (component '{cname}')"
-                        ),
-                        kind: DiagnosticKind::UnknownComponentSignal,
-                        file: self.file.clone(),
-                    });
-                }
-            }
-
-            // Warn on unused outputs: each declared output must be read
-            // via `c.out` somewhere in the enclosing template.
-            let reads_for_c: HashSet<&str> = access
-                .reads
-                .get(cname)
-                .into_iter()
-                .flatten()
-                .map(|(n, _)| n.as_str())
-                .collect();
-            for (name, _) in &outputs {
-                if !reads_for_c.contains(name.as_str()) {
-                    self.diagnostics.push(SymbolDiagnostic {
-                        span: info.decl_span,
-                        message: format!("output '{name}' of component '{cname}' is never read"),
-                        kind: DiagnosticKind::UnusedComponentOutput,
-                        file: self.file.clone(),
-                    });
-                }
-            }
-
-            // Warn on missing input drives: each declared input must be
-            // written via `c.in <== ...` somewhere.
-            let writes_for_c: HashSet<&str> = access
-                .writes
-                .get(cname)
-                .into_iter()
-                .flatten()
-                .map(|(n, _)| n.as_str())
-                .collect();
-            for (name, _) in &inputs {
-                if !writes_for_c.contains(name.as_str()) {
-                    self.diagnostics.push(SymbolDiagnostic {
-                        span: info.decl_span,
-                        message: format!("input '{name}' of component '{cname}' is never assigned"),
-                        kind: DiagnosticKind::MissingComponentInput,
-                        file: self.file.clone(),
-                    });
-                }
-            }
+            self.check_single_component(cname, info, &access);
         }
     }
 
@@ -227,6 +258,27 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn collect_accesses_from_assignment(
+        &self,
+        a: &AssignStmt,
+        components: &HashMap<String, ComponentInfo>,
+        out: &mut ComponentAccess,
+    ) {
+        self.collect_accesses_in_expr(&a.rhs, components, out, /*is_write*/ false);
+        match a.op {
+            AssignOp::SafeLeft | AssignOp::UnsafeLeft => {
+                self.record_if_component_access(&a.lhs, components, out, true);
+                self.collect_accesses_in_expr(&a.lhs, components, out, false);
+            }
+            AssignOp::SafeRight | AssignOp::UnsafeRight => {
+                self.record_if_component_access(&a.rhs, components, out, true);
+            }
+            AssignOp::Eq => {
+                self.collect_accesses_in_expr(&a.lhs, components, out, false);
+            }
+        }
+    }
+
     fn collect_component_accesses(
         &self,
         block: &Block,
@@ -236,19 +288,7 @@ impl<'a> TypeChecker<'a> {
         for stmt in &block.stmts {
             match &stmt.kind {
                 StatementKind::Assignment(a) => {
-                    self.collect_accesses_in_expr(&a.rhs, components, out, /*is_write*/ false);
-                    match a.op {
-                        AssignOp::SafeLeft | AssignOp::UnsafeLeft => {
-                            self.record_if_component_access(&a.lhs, components, out, true);
-                            self.collect_accesses_in_expr(&a.lhs, components, out, false);
-                        }
-                        AssignOp::SafeRight | AssignOp::UnsafeRight => {
-                            self.record_if_component_access(&a.rhs, components, out, true);
-                        }
-                        AssignOp::Eq => {
-                            self.collect_accesses_in_expr(&a.lhs, components, out, false);
-                        }
-                    }
+                    self.collect_accesses_from_assignment(a, components, out);
                 }
                 StatementKind::ConstraintEq(c) => {
                     self.collect_accesses_in_expr(&c.lhs, components, out, false);
@@ -300,6 +340,48 @@ impl<'a> TypeChecker<'a> {
         }
     }
 
+    fn collect_member_access(
+        &self,
+        base: &Expression,
+        field: &Identifier,
+        components: &HashMap<String, ComponentInfo>,
+        out: &mut ComponentAccess,
+        is_write: bool,
+    ) {
+        if let Some(name) = base.extract_base_name() {
+            if components.contains_key(&name) {
+                let map = if is_write {
+                    &mut out.writes
+                } else {
+                    &mut out.reads
+                };
+                map.entry(name)
+                    .or_default()
+                    .push((field.name.clone(), field.span));
+                return;
+            }
+        }
+        self.collect_accesses_in_expr(base, components, out, is_write);
+    }
+
+    fn collect_anon_comp_accesses(
+        &self,
+        ac: &AnonymousComp,
+        components: &HashMap<String, ComponentInfo>,
+        out: &mut ComponentAccess,
+    ) {
+        for a in &ac.template_args {
+            self.collect_accesses_in_expr(a, components, out, false);
+        }
+        for inp in &ac.inputs {
+            match inp {
+                AnonCompInput::Positional(e) | AnonCompInput::Named(_, e) => {
+                    self.collect_accesses_in_expr(e, components, out, false);
+                }
+            }
+        }
+    }
+
     fn collect_accesses_in_expr(
         &self,
         expr: &Expression,
@@ -309,20 +391,7 @@ impl<'a> TypeChecker<'a> {
     ) {
         match expr.kind.as_ref() {
             ExpressionKind::Member(base, field) => {
-                if let Some(name) = base.extract_base_name() {
-                    if components.contains_key(&name) {
-                        let map = if is_write {
-                            &mut out.writes
-                        } else {
-                            &mut out.reads
-                        };
-                        map.entry(name)
-                            .or_default()
-                            .push((field.name.clone(), field.span));
-                        return;
-                    }
-                }
-                self.collect_accesses_in_expr(base, components, out, is_write);
+                self.collect_member_access(base, field, components, out, is_write);
             }
             ExpressionKind::Index(base, idx) => {
                 self.collect_accesses_in_expr(base, components, out, is_write);
@@ -345,16 +414,7 @@ impl<'a> TypeChecker<'a> {
                 }
             }
             ExpressionKind::AnonymousComp(ac) => {
-                for a in &ac.template_args {
-                    self.collect_accesses_in_expr(a, components, out, false);
-                }
-                for inp in &ac.inputs {
-                    match inp {
-                        AnonCompInput::Positional(e) | AnonCompInput::Named(_, e) => {
-                            self.collect_accesses_in_expr(e, components, out, false);
-                        }
-                    }
-                }
+                self.collect_anon_comp_accesses(ac, components, out);
             }
             ExpressionKind::ArrayLit(elems) => {
                 for e in elems {
@@ -785,6 +845,15 @@ impl<'a> TypeChecker<'a> {
 struct ComponentInfo {
     template_name: Option<String>,
     decl_span: Span,
+}
+
+/// Summary of the signal-shape of a template body: every declared signal's
+/// name plus separate lists of output/input signal names and their spans.
+#[derive(Default)]
+struct TemplateSignalInfo {
+    known: HashSet<String>,
+    outputs: Vec<(String, Span)>,
+    inputs: Vec<(String, Span)>,
 }
 
 /// Map of `component name -> [(field, span)]`. Reads and writes are tracked

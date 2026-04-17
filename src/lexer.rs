@@ -262,6 +262,60 @@ pub enum CommentKind {
 ///
 /// Unterminated block comments are reported as best-effort — the
 /// comment is considered to run until the end of the source.
+fn skip_string_literal(bytes: &[u8], mut i: usize) -> usize {
+    let len = bytes.len();
+    i += 1;
+    while i < len {
+        match bytes[i] {
+            b'\\' if i + 1 < len => i += 2,
+            b'"' => {
+                i += 1;
+                break;
+            }
+            _ => i += 1,
+        }
+    }
+    i
+}
+
+fn read_line_comment(source: &str, bytes: &[u8], start: usize) -> (Comment, usize) {
+    let trailing = is_trailing_at(bytes, start);
+    let mut j = start + 2;
+    while j < bytes.len() && bytes[j] != b'\n' {
+        j += 1;
+    }
+    (
+        Comment {
+            start,
+            end: j,
+            kind: CommentKind::Line,
+            text: source[start..j].to_string(),
+            trailing,
+        },
+        j,
+    )
+}
+
+fn read_block_comment(source: &str, bytes: &[u8], start: usize) -> (Comment, usize) {
+    let len = bytes.len();
+    let trailing = is_trailing_at(bytes, start);
+    let mut j = start + 2;
+    while j + 1 < len && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+        j += 1;
+    }
+    let end = if j + 1 < len { j + 2 } else { len };
+    (
+        Comment {
+            start,
+            end,
+            kind: CommentKind::Block,
+            text: source[start..end].to_string(),
+            trailing,
+        },
+        end,
+    )
+}
+
 pub fn extract_comments(source: &str) -> Vec<Comment> {
     let bytes = source.as_bytes();
     let len = bytes.len();
@@ -274,56 +328,23 @@ pub fn extract_comments(source: &str) -> Vec<Comment> {
         // Skip string literals so their contents don't trigger false
         // positives.
         if b == b'"' {
-            i += 1;
-            while i < len {
-                match bytes[i] {
-                    b'\\' if i + 1 < len => i += 2,
-                    b'"' => {
-                        i += 1;
-                        break;
-                    }
-                    _ => i += 1,
-                }
-            }
+            i = skip_string_literal(bytes, i);
             continue;
         }
 
         // Line comment.
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
-            let start = i;
-            let trailing = is_trailing_at(bytes, start);
-            let mut j = i + 2;
-            while j < len && bytes[j] != b'\n' {
-                j += 1;
-            }
-            out.push(Comment {
-                start,
-                end: j,
-                kind: CommentKind::Line,
-                text: source[start..j].to_string(),
-                trailing,
-            });
-            i = j;
+            let (c, next) = read_line_comment(source, bytes, i);
+            out.push(c);
+            i = next;
             continue;
         }
 
         // Block comment.
         if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            let start = i;
-            let trailing = is_trailing_at(bytes, start);
-            let mut j = i + 2;
-            while j + 1 < len && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
-                j += 1;
-            }
-            let end = if j + 1 < len { j + 2 } else { len };
-            out.push(Comment {
-                start,
-                end,
-                kind: CommentKind::Block,
-                text: source[start..end].to_string(),
-                trailing,
-            });
-            i = end;
+            let (c, next) = read_block_comment(source, bytes, i);
+            out.push(c);
+            i = next;
             continue;
         }
 

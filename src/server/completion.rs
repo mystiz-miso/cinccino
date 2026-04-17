@@ -215,62 +215,70 @@ fn function_body_completions(
     items
 }
 
+fn component_dot_completions(
+    table: &SymbolTable,
+    file_path: &str,
+    scope: ScopeId,
+    template_name: Option<&String>,
+) -> Vec<CompletionItem> {
+    let Some(tmpl_name) = template_name else {
+        return Vec::new();
+    };
+    let Some(tmpl) = table.lookup_with_includes(scope, tmpl_name, file_path) else {
+        return Vec::new();
+    };
+    match &tmpl.kind {
+        SymbolKind::Template(t) => scope_members_as_completions(table, t.body_scope, |kind| {
+            matches!(kind, SymbolKind::Signal(_))
+        }),
+        _ => Vec::new(),
+    }
+}
+
+fn signal_dot_completions(
+    table: &SymbolTable,
+    file_path: &str,
+    scope: ScopeId,
+    sig: &crate::symbol::SignalSymbol,
+) -> Vec<CompletionItem> {
+    if let Some(bus_name) = &sig.bus_type {
+        let Some(bus) = table.lookup_with_includes(scope, bus_name, file_path) else {
+            return Vec::new();
+        };
+        match &bus.kind {
+            SymbolKind::Bus(b) => scope_members_as_completions(table, b.body_scope, |_| true),
+            _ => Vec::new(),
+        }
+    } else {
+        sig.tags
+            .iter()
+            .enumerate()
+            .map(|(i, tag)| CompletionItem {
+                label: tag.clone(),
+                kind: Some(CompletionItemKind::PROPERTY),
+                detail: Some("tag".to_string()),
+                sort_text: Some(format!("0_{i:03}")),
+                ..Default::default()
+            })
+            .collect()
+    }
+}
+
 fn dot_completions(
     table: &SymbolTable,
     file_path: &str,
     receiver: &str,
     scope: ScopeId,
 ) -> Vec<CompletionItem> {
-    let sym = match table.lookup_with_includes(scope, receiver, file_path) {
-        Some(s) => s,
-        None => return Vec::new(),
+    let Some(sym) = table.lookup_with_includes(scope, receiver, file_path) else {
+        return Vec::new();
     };
 
     match &sym.kind {
         SymbolKind::Component(comp) => {
-            let tmpl_name = match &comp.template_name {
-                Some(n) => n,
-                None => return Vec::new(),
-            };
-            let tmpl = match table.lookup_with_includes(scope, tmpl_name, file_path) {
-                Some(s) => s,
-                None => return Vec::new(),
-            };
-            match &tmpl.kind {
-                SymbolKind::Template(t) => {
-                    scope_members_as_completions(table, t.body_scope, |kind| {
-                        matches!(kind, SymbolKind::Signal(_))
-                    })
-                }
-                _ => Vec::new(),
-            }
+            component_dot_completions(table, file_path, scope, comp.template_name.as_ref())
         }
-        SymbolKind::Signal(sig) => {
-            if let Some(bus_name) = &sig.bus_type {
-                let bus = match table.lookup_with_includes(scope, bus_name, file_path) {
-                    Some(s) => s,
-                    None => return Vec::new(),
-                };
-                match &bus.kind {
-                    SymbolKind::Bus(b) => {
-                        scope_members_as_completions(table, b.body_scope, |_| true)
-                    }
-                    _ => Vec::new(),
-                }
-            } else {
-                sig.tags
-                    .iter()
-                    .enumerate()
-                    .map(|(i, tag)| CompletionItem {
-                        label: tag.clone(),
-                        kind: Some(CompletionItemKind::PROPERTY),
-                        detail: Some("tag".to_string()),
-                        sort_text: Some(format!("0_{i:03}")),
-                        ..Default::default()
-                    })
-                    .collect()
-            }
-        }
+        SymbolKind::Signal(sig) => signal_dot_completions(table, file_path, scope, sig),
         _ => Vec::new(),
     }
 }
@@ -376,46 +384,40 @@ fn add_scope_local_symbols(
     }
 }
 
-fn symbol_to_completion(sym: &crate::symbol::Symbol, index: usize) -> CompletionItem {
-    let (kind, detail, insert_text, insert_text_format) = match &sym.kind {
-        SymbolKind::Template(t) => {
-            let params = if t.params.is_empty() {
-                "()".to_string()
-            } else {
-                let params_snippet: Vec<String> = t
-                    .params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("${{{}}}", i + 1))
-                    .collect();
-                format!("({})", params_snippet.join(", "))
-            };
-            (
-                CompletionItemKind::CLASS,
-                format!("template({})", t.params.join(", ")),
-                Some(format!("{}{}", sym.name, params)),
-                Some(InsertTextFormat::SNIPPET),
-            )
-        }
-        SymbolKind::Function(f) => {
-            let params = if f.params.is_empty() {
-                "()".to_string()
-            } else {
-                let params_snippet: Vec<String> = f
-                    .params
-                    .iter()
-                    .enumerate()
-                    .map(|(i, _)| format!("${{{}}}", i + 1))
-                    .collect();
-                format!("({})", params_snippet.join(", "))
-            };
-            (
-                CompletionItemKind::FUNCTION,
-                format!("function({})", f.params.join(", ")),
-                Some(format!("{}{}", sym.name, params)),
-                Some(InsertTextFormat::SNIPPET),
-            )
-        }
+fn param_snippet(params: &[String]) -> String {
+    if params.is_empty() {
+        "()".to_string()
+    } else {
+        let params_snippet: Vec<String> = params
+            .iter()
+            .enumerate()
+            .map(|(i, _)| format!("${{{}}}", i + 1))
+            .collect();
+        format!("({})", params_snippet.join(", "))
+    }
+}
+
+type CompletionBits = (
+    CompletionItemKind,
+    String,
+    Option<String>,
+    Option<InsertTextFormat>,
+);
+
+fn symbol_completion_bits(sym: &crate::symbol::Symbol) -> CompletionBits {
+    match &sym.kind {
+        SymbolKind::Template(t) => (
+            CompletionItemKind::CLASS,
+            format!("template({})", t.params.join(", ")),
+            Some(format!("{}{}", sym.name, param_snippet(&t.params))),
+            Some(InsertTextFormat::SNIPPET),
+        ),
+        SymbolKind::Function(f) => (
+            CompletionItemKind::FUNCTION,
+            format!("function({})", f.params.join(", ")),
+            Some(format!("{}{}", sym.name, param_snippet(&f.params))),
+            Some(InsertTextFormat::SNIPPET),
+        ),
         SymbolKind::Bus(b) => (
             CompletionItemKind::STRUCT,
             format!("bus({})", b.params.join(", ")),
@@ -449,7 +451,11 @@ fn symbol_to_completion(sym: &crate::symbol::Symbol, index: usize) -> Completion
             None,
             None,
         ),
-    };
+    }
+}
+
+fn symbol_to_completion(sym: &crate::symbol::Symbol, index: usize) -> CompletionItem {
+    let (kind, detail, insert_text, insert_text_format) = symbol_completion_bits(sym);
 
     CompletionItem {
         label: sym.name.clone(),
@@ -582,6 +588,103 @@ pub(crate) fn find_scope_at_offset_ast(
 /// `For`, `While`, and one or two per `IfElse`). We track a running
 /// index into the block-kind children so that sibling scope-creating
 /// statements resolve to the correct child scope.
+/// Result of attempting to descend through a statement: either a resolved
+/// child scope (Some) or the number of scope-children the statement
+/// consumed (used to keep the outer sibling-index in sync).
+enum DescendResult {
+    Resolved(ScopeId),
+    Advance(usize),
+}
+
+fn descend_if_else(
+    table: &SymbolTable,
+    block_children: &[ScopeId],
+    child_idx: usize,
+    ie: &ast::IfElse,
+    offset: usize,
+    contains_offset: bool,
+) -> DescendResult {
+    if !contains_offset {
+        return DescendResult::Advance(if ie.else_body.is_some() { 2 } else { 1 });
+    }
+    let mut idx = child_idx;
+    if ie.then_body.span.start <= offset && offset <= ie.then_body.span.end {
+        if let Some(&child) = block_children.get(idx) {
+            return DescendResult::Resolved(find_deepest_block_scope(
+                table,
+                child,
+                &ie.then_body,
+                offset,
+            ));
+        }
+    }
+    idx += 1;
+    if let Some(else_body) = &ie.else_body {
+        if else_body.span.start <= offset && offset <= else_body.span.end {
+            if let Some(&child) = block_children.get(idx) {
+                return DescendResult::Resolved(find_deepest_block_scope(
+                    table, child, else_body, offset,
+                ));
+            }
+        }
+    }
+    DescendResult::Advance(if ie.else_body.is_some() { 2 } else { 1 })
+}
+
+fn descend_stmt(
+    table: &SymbolTable,
+    block_children: &[ScopeId],
+    child_idx: usize,
+    stmt: &ast::Statement,
+    offset: usize,
+) -> DescendResult {
+    let contains_offset = stmt.span.start <= offset && offset <= stmt.span.end;
+    match &stmt.kind {
+        ast::StatementKind::Block(inner) => {
+            if contains_offset {
+                if let Some(&child) = block_children.get(child_idx) {
+                    return DescendResult::Resolved(find_deepest_block_scope(
+                        table, child, inner, offset,
+                    ));
+                }
+            }
+            DescendResult::Advance(1)
+        }
+        ast::StatementKind::For(for_loop) => {
+            if contains_offset && for_loop.body.span.start <= offset {
+                if let Some(&child) = block_children.get(child_idx) {
+                    return DescendResult::Resolved(find_deepest_block_scope(
+                        table,
+                        child,
+                        &for_loop.body,
+                        offset,
+                    ));
+                }
+            }
+            DescendResult::Advance(1)
+        }
+        ast::StatementKind::IfElse(ie) => descend_if_else(
+            table,
+            block_children,
+            child_idx,
+            ie,
+            offset,
+            contains_offset,
+        ),
+        ast::StatementKind::While(w) => {
+            if contains_offset && w.body.span.start <= offset {
+                if let Some(&child) = block_children.get(child_idx) {
+                    return DescendResult::Resolved(find_deepest_block_scope(
+                        table, child, &w.body, offset,
+                    ));
+                }
+            }
+            DescendResult::Advance(1)
+        }
+        _ => DescendResult::Advance(0),
+    }
+}
+
 fn find_deepest_block_scope(
     table: &SymbolTable,
     body_scope: ScopeId,
@@ -598,61 +701,10 @@ fn find_deepest_block_scope(
         .collect();
 
     let mut child_idx = 0usize;
-
-    // Check each statement for nested blocks.
     for stmt in &block.stmts {
-        let contains_offset = stmt.span.start <= offset && offset <= stmt.span.end;
-        match &stmt.kind {
-            ast::StatementKind::Block(inner) => {
-                if contains_offset {
-                    if let Some(&child) = block_children.get(child_idx) {
-                        return find_deepest_block_scope(table, child, inner, offset);
-                    }
-                }
-                child_idx += 1;
-            }
-            ast::StatementKind::For(for_loop) => {
-                if contains_offset && for_loop.body.span.start <= offset {
-                    if let Some(&child) = block_children.get(child_idx) {
-                        return find_deepest_block_scope(table, child, &for_loop.body, offset);
-                    }
-                }
-                child_idx += 1;
-            }
-            ast::StatementKind::IfElse(ie) => {
-                if contains_offset {
-                    if ie.then_body.span.start <= offset && offset <= ie.then_body.span.end {
-                        if let Some(&child) = block_children.get(child_idx) {
-                            return find_deepest_block_scope(table, child, &ie.then_body, offset);
-                        }
-                    }
-                    // then-branch scope
-                    child_idx += 1;
-                    if let Some(else_body) = &ie.else_body {
-                        if else_body.span.start <= offset && offset <= else_body.span.end {
-                            if let Some(&child) = block_children.get(child_idx) {
-                                return find_deepest_block_scope(table, child, else_body, offset);
-                            }
-                        }
-                        child_idx += 1;
-                    }
-                } else {
-                    // Still need to advance the index past this statement's scopes.
-                    child_idx += 1; // then
-                    if ie.else_body.is_some() {
-                        child_idx += 1; // else
-                    }
-                }
-            }
-            ast::StatementKind::While(w) => {
-                if contains_offset && w.body.span.start <= offset {
-                    if let Some(&child) = block_children.get(child_idx) {
-                        return find_deepest_block_scope(table, child, &w.body, offset);
-                    }
-                }
-                child_idx += 1;
-            }
-            _ => {}
+        match descend_stmt(table, &block_children, child_idx, stmt, offset) {
+            DescendResult::Resolved(s) => return s,
+            DescendResult::Advance(n) => child_idx += n,
         }
     }
 

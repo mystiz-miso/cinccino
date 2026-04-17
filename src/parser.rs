@@ -741,6 +741,43 @@ impl Parser {
         }
     }
 
+    fn parse_bus_instance_decl(&mut self, start: Span, signal_kind: SignalKind) -> StatementKind {
+        self.require_version(
+            &Version {
+                major: 2,
+                minor: 2,
+                patch: 0,
+            },
+            "bus instance declarations",
+            self.current_span(),
+        );
+        let bus_type = self.parse_bus_type();
+        let tags = self.parse_optional_tags();
+        let name = self.expect_decl_name();
+        let dimensions = self.parse_dimensions();
+
+        let init = if self.check(&Token::LeftSignalAssign) {
+            self.advance();
+            Some((SignalAssignOp::SafeLeft, self.parse_expression()))
+        } else if self.check(&Token::LeftUnsafeAssign) {
+            self.advance();
+            Some((SignalAssignOp::UnsafeLeft, self.parse_expression()))
+        } else {
+            None
+        };
+        self.expect_semi();
+
+        StatementKind::BusDecl(BusInstanceDecl {
+            span: start.merge(self.prev_span()),
+            bus_type,
+            signal_kind,
+            tags,
+            name,
+            dimensions,
+            init,
+        })
+    }
+
     fn parse_signal_decl_stmt(&mut self) -> Option<StatementKind> {
         let start = self.current_span();
         self.advance(); // eat `signal`
@@ -759,40 +796,7 @@ impl Parser {
 
         // Check for bus type: `signal input BusName() { tags } name`
         if self.is_bus_type_ahead() {
-            self.require_version(
-                &Version {
-                    major: 2,
-                    minor: 2,
-                    patch: 0,
-                },
-                "bus instance declarations",
-                self.current_span(),
-            );
-            let bus_type = self.parse_bus_type();
-            let tags = self.parse_optional_tags();
-            let name = self.expect_decl_name();
-            let dimensions = self.parse_dimensions();
-
-            let init = if self.check(&Token::LeftSignalAssign) {
-                self.advance();
-                Some((SignalAssignOp::SafeLeft, self.parse_expression()))
-            } else if self.check(&Token::LeftUnsafeAssign) {
-                self.advance();
-                Some((SignalAssignOp::UnsafeLeft, self.parse_expression()))
-            } else {
-                None
-            };
-            self.expect_semi();
-
-            return Some(StatementKind::BusDecl(BusInstanceDecl {
-                span: start.merge(self.prev_span()),
-                bus_type,
-                signal_kind: kind,
-                tags,
-                name,
-                dimensions,
-                init,
-            }));
+            return Some(self.parse_bus_instance_decl(start, kind));
         }
 
         let tags = self.parse_optional_tags();
@@ -1513,6 +1517,32 @@ impl Parser {
         }
     }
 
+    fn parse_call_or_anon_comp(&mut self, start: Span, callee: Expression) -> Expression {
+        self.advance();
+        let args = self.parse_call_args();
+        self.expect(&Token::RParen);
+
+        // Check for anonymous component: Template(params)(inputs)
+        if self.check(&Token::LParen) {
+            self.advance();
+            let inputs = self.parse_anon_comp_inputs();
+            self.expect(&Token::RParen);
+            Expression {
+                span: start.merge(self.prev_span()),
+                kind: Box::new(ExpressionKind::AnonymousComp(AnonymousComp {
+                    template: callee,
+                    template_args: args,
+                    inputs,
+                })),
+            }
+        } else {
+            Expression {
+                span: start.merge(self.prev_span()),
+                kind: Box::new(ExpressionKind::Call(callee, args)),
+            }
+        }
+    }
+
     fn parse_postfix(&mut self) -> Expression {
         let start = self.current_span();
         let mut expr = self.parse_primary();
@@ -1539,31 +1569,7 @@ impl Parser {
                     };
                 }
                 Some(Token::LParen) => {
-                    self.advance();
-                    let args = self.parse_call_args();
-                    self.expect(&Token::RParen);
-
-                    // Check for anonymous component: Template(params)(inputs)
-                    if self.check(&Token::LParen) {
-                        self.advance();
-                        let inputs = self.parse_anon_comp_inputs();
-                        self.expect(&Token::RParen);
-                        let span = start.merge(self.prev_span());
-                        expr = Expression {
-                            span,
-                            kind: Box::new(ExpressionKind::AnonymousComp(AnonymousComp {
-                                template: expr,
-                                template_args: args,
-                                inputs,
-                            })),
-                        };
-                    } else {
-                        let span = start.merge(self.prev_span());
-                        expr = Expression {
-                            span,
-                            kind: Box::new(ExpressionKind::Call(expr, args)),
-                        };
-                    }
+                    expr = self.parse_call_or_anon_comp(start, expr);
                 }
                 _ => break,
             }
@@ -1609,35 +1615,78 @@ impl Parser {
         AnonCompInput::Positional(self.parse_expression())
     }
 
+    fn parse_array_lit_tail(&mut self, start: Span) -> Expression {
+        let mut elems = Vec::new();
+        if !self.check(&Token::RBracket) {
+            elems.push(self.parse_expression());
+            while self.eat(&Token::Comma) {
+                if self.check(&Token::RBracket) {
+                    break; // trailing comma
+                }
+                elems.push(self.parse_expression());
+            }
+        }
+        self.expect(&Token::RBracket);
+        Expression {
+            span: start.merge(self.prev_span()),
+            kind: Box::new(ExpressionKind::ArrayLit(elems)),
+        }
+    }
+
+    fn parse_paren_tail(&mut self, start: Span) -> Expression {
+        let expr = self.parse_expression();
+        self.expect(&Token::RParen);
+        Expression {
+            span: start.merge(self.prev_span()),
+            kind: Box::new(ExpressionKind::Paren(expr)),
+        }
+    }
+
+    fn parse_primary_number(&mut self, start: Span) -> Expression {
+        if let Token::NumberLit(s) = self.advance().unwrap().token.clone() {
+            Expression {
+                span: start,
+                kind: Box::new(ExpressionKind::Number(s)),
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn parse_primary_ident(&mut self, start: Span) -> Expression {
+        if let Token::Ident(s) = self.advance().unwrap().token.clone() {
+            Expression {
+                span: start,
+                kind: Box::new(ExpressionKind::Ident(s)),
+            }
+        } else {
+            unreachable!()
+        }
+    }
+
+    fn parse_primary_error(&mut self, start: Span) -> Expression {
+        self.error("expected expression");
+        // Advance past the unexpected token so callers don't loop
+        // on the same position
+        if self.peek().is_some() {
+            self.advance();
+        }
+        Expression {
+            span: start,
+            kind: Box::new(ExpressionKind::Error),
+        }
+    }
+
     fn parse_primary(&mut self) -> Expression {
         let start = self.current_span();
         match self.peek() {
-            Some(Token::NumberLit(_)) => {
-                if let Token::NumberLit(s) = self.advance().unwrap().token.clone() {
-                    Expression {
-                        span: start,
-                        kind: Box::new(ExpressionKind::Number(s)),
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
-            Some(Token::Ident(_)) => {
-                if let Token::Ident(s) = self.advance().unwrap().token.clone() {
-                    Expression {
-                        span: start,
-                        kind: Box::new(ExpressionKind::Ident(s)),
-                    }
-                } else {
-                    unreachable!()
-                }
-            }
+            Some(Token::NumberLit(_)) => self.parse_primary_number(start),
+            Some(Token::Ident(_)) => self.parse_primary_ident(start),
             Some(Token::Parallel) => {
                 self.advance();
                 let expr = self.parse_expression();
-                let span = start.merge(self.prev_span());
                 Expression {
-                    span,
+                    span: start.merge(self.prev_span()),
                     kind: Box::new(ExpressionKind::Parallel(expr)),
                 }
             }
@@ -1650,45 +1699,13 @@ impl Parser {
             }
             Some(Token::LParen) => {
                 self.advance();
-                let expr = self.parse_expression();
-                self.expect(&Token::RParen);
-                let span = start.merge(self.prev_span());
-                Expression {
-                    span,
-                    kind: Box::new(ExpressionKind::Paren(expr)),
-                }
+                self.parse_paren_tail(start)
             }
             Some(Token::LBracket) => {
                 self.advance();
-                let mut elems = Vec::new();
-                if !self.check(&Token::RBracket) {
-                    elems.push(self.parse_expression());
-                    while self.eat(&Token::Comma) {
-                        if self.check(&Token::RBracket) {
-                            break; // trailing comma
-                        }
-                        elems.push(self.parse_expression());
-                    }
-                }
-                self.expect(&Token::RBracket);
-                let span = start.merge(self.prev_span());
-                Expression {
-                    span,
-                    kind: Box::new(ExpressionKind::ArrayLit(elems)),
-                }
+                self.parse_array_lit_tail(start)
             }
-            _ => {
-                self.error("expected expression");
-                // Advance past the unexpected token so callers don't loop
-                // on the same position
-                if self.peek().is_some() {
-                    self.advance();
-                }
-                Expression {
-                    span: start,
-                    kind: Box::new(ExpressionKind::Error),
-                }
-            }
+            _ => self.parse_primary_error(start),
         }
     }
 }
