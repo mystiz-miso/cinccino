@@ -3,9 +3,12 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use super::code_action as ca;
 use super::completion;
 use super::document_symbol;
+use super::formatting as fmt_handler;
 use super::hover;
+use super::rename as rn;
 use super::signature_help as sig_help;
 use super::DocumentStore;
 use crate::parser;
@@ -77,6 +80,7 @@ impl CinccinoBackend {
                 // Run type checker and constraint checker.
                 table.check_types(file_path, &ast);
                 table.check_constraints(file_path, &ast);
+                table.check_underconstrained(file_path, &ast);
                 table.check_undeclared(file_path, &ast);
 
                 // Convert semantic diagnostics to LSP diagnostics.
@@ -94,7 +98,11 @@ impl CinccinoBackend {
                     };
 
                     let severity = match diag.kind {
-                        DiagnosticKind::UnsafeSignalAssignment => DiagnosticSeverity::WARNING,
+                        DiagnosticKind::UnsafeSignalAssignment
+                        | DiagnosticKind::TagLoss
+                        | DiagnosticKind::UnusedComponentOutput
+                        | DiagnosticKind::MissingComponentInput
+                        | DiagnosticKind::UnderconstrainedOutput => DiagnosticSeverity::WARNING,
                         _ => DiagnosticSeverity::ERROR,
                     };
 
@@ -153,6 +161,9 @@ impl LanguageServer for CinccinoBackend {
                     retrigger_characters: Some(vec![",".to_string()]),
                     work_done_progress_options: Default::default(),
                 }),
+                rename_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
+                document_formatting_provider: Some(OneOf::Left(true)),
                 workspace: Some(WorkspaceServerCapabilities {
                     workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                         supported: Some(true),
@@ -605,6 +616,106 @@ impl LanguageServer for CinccinoBackend {
 
     async fn execute_command(&self, _: ExecuteCommandParams) -> Result<Option<Value>> {
         Ok(None)
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let new_name = params.new_name;
+
+        // Validate new name up front.
+        if !rn::is_valid_identifier(&new_name) {
+            return Err(rn::invalid_rename_error(&format!(
+                "'{new_name}' is not a valid Circom identifier"
+            )));
+        }
+
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let offset = match position_to_byte_offset(&text, position) {
+            Some(o) => o,
+            None => return Ok(None),
+        };
+
+        let word = word_at_offset(&text, offset);
+        if word.is_empty() {
+            return Ok(None);
+        }
+
+        // Build the symbol table across all open documents.
+        let (ast, _) = parser::parse(&text);
+        let file_path = uri.as_str();
+        let mut table = SymbolTable::new();
+        table.index_file(file_path, &ast);
+
+        let all_docs = self.documents.all_documents();
+        for (doc_uri, doc_text) in &all_docs {
+            if *doc_uri != uri {
+                let (doc_ast, _) = parser::parse(doc_text);
+                table.index_file(doc_uri.as_str(), &doc_ast);
+            }
+        }
+
+        // Resolve the symbol under the cursor.
+        let scope = completion::find_scope_at_offset_ast(&ast, offset, &table, file_path);
+        let target = match table.lookup_with_includes(scope, &word, file_path) {
+            Some(s) => s.clone(),
+            None => return Ok(None),
+        };
+
+        if !rn::is_renameable(&target.kind) {
+            return Err(rn::invalid_rename_error("symbol cannot be renamed"));
+        }
+
+        // Conflict check: a symbol with `new_name` already lives in the
+        // target's defining scope.
+        if rn::would_conflict(
+            &table,
+            target.scope,
+            &new_name,
+            &target.file,
+            target.span.start,
+        ) {
+            return Err(rn::invalid_rename_error(&format!(
+                "cannot rename: '{new_name}' already exists in this scope"
+            )));
+        }
+
+        let edit = rn::build_workspace_edit(
+            &target.name,
+            &new_name,
+            &target.file,
+            target.span.start,
+            &all_docs,
+        );
+        Ok(Some(edit))
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+
+        let actions = ca::code_actions(&uri, &text, &params.context.diagnostics);
+        if actions.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(actions))
+        }
+    }
+
+    async fn formatting(&self, params: DocumentFormattingParams) -> Result<Option<Vec<TextEdit>>> {
+        let uri = params.text_document.uri;
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        Ok(fmt_handler::format_document(&text, &params.options))
     }
 }
 

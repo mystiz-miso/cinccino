@@ -223,6 +223,135 @@ pub fn tokenize(source: &str) -> (Vec<SpannedToken>, Vec<std::ops::Range<usize>>
     (tokens, errors)
 }
 
+// ── Comment extraction (trivia) ─────────────────────────────────────
+//
+// The lexer above skips comments so that the parser only sees syntactic
+// tokens. For formatter-level trivia preservation, we scan the source
+// independently and return the comments in source order.
+
+/// A Circom comment, preserved as trivia for the formatter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    /// Inclusive start byte offset of the comment (including the
+    /// leading `//` or `/*`).
+    pub start: usize,
+    /// Exclusive end byte offset (including `*/` for block comments,
+    /// excluding the terminating `\n` for line comments).
+    pub end: usize,
+    /// The comment kind — line (`// ...`) or block (`/* ... */`).
+    pub kind: CommentKind,
+    /// The raw comment text as it appears in the source (including the
+    /// `//` or `/* … */` delimiters).
+    pub text: String,
+    /// Whether this comment sits on the same line as source that
+    /// precedes it (i.e., there is non-whitespace earlier on the line).
+    pub trailing: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommentKind {
+    /// `// line comment` up to end of line.
+    Line,
+    /// `/* block comment */`, possibly spanning multiple lines.
+    Block,
+}
+
+/// Scan `source` and return every comment in source order. String
+/// literals are skipped so that `"//"` inside a string is not
+/// mis-identified as a comment.
+///
+/// Unterminated block comments are reported as best-effort — the
+/// comment is considered to run until the end of the source.
+pub fn extract_comments(source: &str) -> Vec<Comment> {
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+
+    while i < len {
+        let b = bytes[i];
+
+        // Skip string literals so their contents don't trigger false
+        // positives.
+        if b == b'"' {
+            i += 1;
+            while i < len {
+                match bytes[i] {
+                    b'\\' if i + 1 < len => i += 2,
+                    b'"' => {
+                        i += 1;
+                        break;
+                    }
+                    _ => i += 1,
+                }
+            }
+            continue;
+        }
+
+        // Line comment.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'/' {
+            let start = i;
+            let trailing = is_trailing_at(bytes, start);
+            let mut j = i + 2;
+            while j < len && bytes[j] != b'\n' {
+                j += 1;
+            }
+            out.push(Comment {
+                start,
+                end: j,
+                kind: CommentKind::Line,
+                text: source[start..j].to_string(),
+                trailing,
+            });
+            i = j;
+            continue;
+        }
+
+        // Block comment.
+        if b == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            let start = i;
+            let trailing = is_trailing_at(bytes, start);
+            let mut j = i + 2;
+            while j + 1 < len && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+                j += 1;
+            }
+            let end = if j + 1 < len { j + 2 } else { len };
+            out.push(Comment {
+                start,
+                end,
+                kind: CommentKind::Block,
+                text: source[start..end].to_string(),
+                trailing,
+            });
+            i = end;
+            continue;
+        }
+
+        i += 1;
+    }
+
+    out
+}
+
+/// Return `true` when `offset` in `bytes` has non-whitespace content
+/// earlier on the same line (i.e., the character at `offset` is a
+/// trailing/inline token rather than a leading one).
+fn is_trailing_at(bytes: &[u8], offset: usize) -> bool {
+    if offset == 0 {
+        return false;
+    }
+    let mut k = offset;
+    while k > 0 {
+        k -= 1;
+        match bytes[k] {
+            b'\n' => return false,
+            b' ' | b'\t' | b'\r' => continue,
+            _ => return true,
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +492,53 @@ mod tests {
         for (i, exp) in expected.iter().enumerate() {
             assert_eq!(&tokens[i].token, exp, "mismatch at index {}", i);
         }
+    }
+
+    #[test]
+    fn test_extract_comments_line() {
+        let src = "signal // a line comment\ninput x;";
+        let comments = extract_comments(src);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].kind, CommentKind::Line);
+        assert_eq!(comments[0].text, "// a line comment");
+        assert!(comments[0].trailing);
+    }
+
+    #[test]
+    fn test_extract_comments_block() {
+        let src = "signal /* block\ncomment */ x;";
+        let comments = extract_comments(src);
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].kind, CommentKind::Block);
+        assert_eq!(comments[0].text, "/* block\ncomment */");
+    }
+
+    #[test]
+    fn test_extract_comments_leading() {
+        let src = "// leading\nsignal x;";
+        let comments = extract_comments(src);
+        assert_eq!(comments.len(), 1);
+        assert!(!comments[0].trailing, "should be leading");
+    }
+
+    #[test]
+    fn test_extract_comments_inside_string_ignored() {
+        let src = r#"log("// not a comment"); signal x;"#;
+        let comments = extract_comments(src);
+        assert!(
+            comments.is_empty(),
+            "should not find comments in strings: {comments:?}"
+        );
+    }
+
+    #[test]
+    fn test_extract_comments_multiple() {
+        let src = "// one\ntemplate T() {\n    // two\n    signal /* three */ x;\n}\n";
+        let comments = extract_comments(src);
+        assert_eq!(comments.len(), 3);
+        assert_eq!(comments[0].text, "// one");
+        assert_eq!(comments[1].text, "// two");
+        assert_eq!(comments[2].text, "/* three */");
     }
 
     #[test]

@@ -1501,3 +1501,298 @@ async fn initialize_advertises_definition_provider() {
 
     client.shutdown_and_exit().await;
 }
+
+#[tokio::test]
+async fn initialize_advertises_rename_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["renameProvider"], true,
+        "should advertise rename"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn initialize_advertises_code_action_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["codeActionProvider"], true,
+        "should advertise code action"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── rename ─────────────────────
+
+#[tokio::test]
+async fn rename_template_updates_single_file() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/rename_single.circom";
+    // "Adder" is declared on line 0 and referenced on line 6.
+    let text = "template Adder(n) {\n    signal input a;\n    signal input b;\n    signal output c;\n    c <== a + b;\n}\ntemplate Main() {\n    component c = Adder(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Rename "Adder" at line 0, col 9 to "Sum".
+    let resp = client
+        .request(
+            "textDocument/rename",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "Sum",
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected workspace edit, got null");
+    let changes = &result["changes"];
+    let edits = changes[uri].as_array().expect("edits array");
+    // Should produce edits for the declaration and at least one usage.
+    assert!(edits.len() >= 2, "expected >= 2 edits, got: {edits:?}");
+    for edit in edits {
+        assert_eq!(edit["newText"], "Sum");
+    }
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn rename_rejects_invalid_identifier() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/rename_invalid.circom";
+    let text = "template Foo() {\n    signal input x;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Attempt to rename "Foo" to "123bad" — not a valid identifier.
+    let resp = client
+        .request(
+            "textDocument/rename",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "123bad",
+            })),
+        )
+        .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "expected error for invalid identifier, got: {resp}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn rename_rejects_conflict_in_same_scope() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/rename_conflict.circom";
+    // Two templates at file scope; renaming Foo -> Bar would collide.
+    let text =
+        "template Foo() {\n    signal input x;\n}\ntemplate Bar() {\n    signal input y;\n}\n";
+    client.open_doc(uri, text).await;
+
+    let resp = client
+        .request(
+            "textDocument/rename",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 0, "character": 9 },
+                "newName": "Bar",
+            })),
+        )
+        .await;
+
+    assert!(
+        resp.get("error").is_some(),
+        "expected error for scope conflict, got: {resp}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn rename_cross_file_updates_all() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri_a = "file:///test/rename_a.circom";
+    let text_a = "template Foo() {\n    signal input x;\n}\n";
+    client.open_doc(uri_a, text_a).await;
+
+    let uri_b = "file:///test/rename_b.circom";
+    let text_b = "include \"rename_a.circom\";\ntemplate Bar() {\n    component c = Foo();\n}\n";
+    client.open_doc(uri_b, text_b).await;
+
+    // Rename "Foo" in file a to "Baz".
+    let resp = client
+        .request(
+            "textDocument/rename",
+            Some(json!({
+                "textDocument": { "uri": uri_a },
+                "position": { "line": 0, "character": 9 },
+                "newName": "Baz",
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected workspace edit");
+    let changes = result["changes"].as_object().expect("changes map");
+    // Should touch both files.
+    assert!(changes.contains_key(uri_a), "expected edit in file a");
+    assert!(changes.contains_key(uri_b), "expected edit in file b");
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── code actions ─────────────────────
+
+#[tokio::test]
+async fn code_action_declare_missing_signal() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/ca_missing.circom";
+    // "a" is used but never declared.
+    let text = "template T() {\n    signal output c;\n    c <== a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Simulate a published undeclared-symbol diagnostic at `a`.
+    let diag = json!({
+        "range": {
+            "start": { "line": 2, "character": 9 },
+            "end":   { "line": 2, "character": 10 }
+        },
+        "severity": 1,
+        "source": "cinccino",
+        "message": "undeclared symbol 'a'"
+    });
+
+    let resp = client
+        .request(
+            "textDocument/codeAction",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 2, "character": 9 },
+                    "end":   { "line": 2, "character": 10 }
+                },
+                "context": { "diagnostics": [diag] },
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    assert!(
+        !result.is_empty(),
+        "expected a code action, got: {result:?}"
+    );
+    let titles: Vec<&str> = result
+        .iter()
+        .map(|a| a["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles
+            .iter()
+            .any(|t| t.contains("signal") && t.contains('a')),
+        "expected declare-signal action: {titles:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn code_action_change_unsafe_assign() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/ca_unsafe.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <-- a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Simulate a WARNING diagnostic spanning the `b <-- a` statement.
+    let diag = json!({
+        "range": {
+            "start": { "line": 3, "character": 4 },
+            "end":   { "line": 3, "character": 11 }
+        },
+        "severity": 2,
+        "source": "cinccino",
+        "message": "signal 'b' assigned with '<--' without a corresponding '===' constraint"
+    });
+
+    let resp = client
+        .request(
+            "textDocument/codeAction",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 3, "character": 4 },
+                    "end":   { "line": 3, "character": 11 }
+                },
+                "context": { "diagnostics": [diag] },
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    assert!(!result.is_empty(), "expected a code action");
+    let titles: Vec<&str> = result
+        .iter()
+        .map(|a| a["title"].as_str().unwrap())
+        .collect();
+    assert!(
+        titles.iter().any(|t| t.contains("<==")),
+        "expected 'Change <-- to <==' action: {titles:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn code_action_empty_for_no_matching_diagnostics() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/ca_none.circom";
+    let text = "template T() { signal input a; }\n";
+    client.open_doc(uri, text).await;
+
+    let resp = client
+        .request(
+            "textDocument/codeAction",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end":   { "line": 0, "character": 0 }
+                },
+                "context": { "diagnostics": [] },
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(
+        result.is_null(),
+        "expected null for no diagnostics, got: {result}"
+    );
+
+    client.shutdown_and_exit().await;
+}

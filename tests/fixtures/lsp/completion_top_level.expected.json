@@ -1,0 +1,6 @@
+{
+  "completion": {
+    "position": { "line": 2, "character": 0 },
+    "must_contain": ["template", "function", "include"]
+  }
+}

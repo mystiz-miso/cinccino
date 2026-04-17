@@ -1,0 +1,6 @@
+{
+  "hover": {
+    "position": { "line": 3, "character": 10 },
+    "must_contain": "signal input"
+  }
+}

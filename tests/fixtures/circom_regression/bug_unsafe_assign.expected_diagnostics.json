@@ -1,0 +1,6 @@
+{
+  "note": "<-- without matching === is unsafe (warning).",
+  "diagnostics": [
+    { "kind": "UnsafeSignalAssignment" }
+  ]
+}

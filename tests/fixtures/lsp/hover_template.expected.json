@@ -1,0 +1,6 @@
+{
+  "hover": {
+    "position": { "line": 7, "character": 20 },
+    "must_contain": "template Adder(n)"
+  }
+}

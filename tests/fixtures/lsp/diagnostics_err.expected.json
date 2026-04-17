@@ -1,0 +1,6 @@
+{
+  "diagnostics": {
+    "min_count": 1,
+    "must_contain": ["input signal"]
+  }
+}

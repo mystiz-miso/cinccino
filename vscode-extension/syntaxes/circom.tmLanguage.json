@@ -1,0 +1,82 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Circom",
+  "scopeName": "source.circom",
+  "fileTypes": ["circom"],
+  "patterns": [
+    { "include": "#comments" },
+    { "include": "#keywords" },
+    { "include": "#types" },
+    { "include": "#constants" },
+    { "include": "#strings" },
+    { "include": "#numbers" },
+    { "include": "#operators" }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "match": "//.*$",
+          "name": "comment.line.double-slash.circom"
+        },
+        {
+          "begin": "/\\*",
+          "end": "\\*/",
+          "name": "comment.block.circom"
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "match": "\\b(pragma|include|template|function|component|main|public|private|parallel|return|if|else|for|while|do|assert|log|custom_templates|bus)\\b",
+          "name": "keyword.control.circom"
+        }
+      ]
+    },
+    "types": {
+      "patterns": [
+        {
+          "match": "\\b(signal|input|output|var)\\b",
+          "name": "storage.type.circom"
+        }
+      ]
+    },
+    "constants": {
+      "patterns": [
+        {
+          "match": "\\b(true|false)\\b",
+          "name": "constant.language.circom"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "begin": "\"",
+          "end": "\"",
+          "name": "string.quoted.double.circom",
+          "patterns": [
+            { "match": "\\\\.", "name": "constant.character.escape.circom" }
+          ]
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "match": "\\b(0x[0-9a-fA-F]+|[0-9]+)\\b",
+          "name": "constant.numeric.circom"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "match": "<==|==>|<--|-->|===|==|!=|<=|>=|<<|>>|&&|\\|\\||=>|->",
+          "name": "keyword.operator.circom"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "note": "Cubic term a*b*c is not R1CS quadratic.",
+  "diagnostics": [
+    { "kind": "NonQuadraticConstraint" }
+  ]
+}

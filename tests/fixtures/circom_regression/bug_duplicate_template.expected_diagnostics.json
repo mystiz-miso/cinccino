@@ -1,0 +1,6 @@
+{
+  "note": "Redefinition of template name.",
+  "diagnostics": [
+    { "kind": "DuplicateSymbol" }
+  ]
+}

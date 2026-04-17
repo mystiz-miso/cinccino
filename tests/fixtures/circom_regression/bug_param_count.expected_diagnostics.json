@@ -1,0 +1,6 @@
+{
+  "note": "Template expects 1 parameter but 2 provided.",
+  "diagnostics": [
+    { "kind": "ParameterCountMismatch" }
+  ]
+}

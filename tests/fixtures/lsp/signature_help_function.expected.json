@@ -1,0 +1,7 @@
+{
+  "signature_help": {
+    "position": { "line": 4, "character": 19 },
+    "signature_label": "add(a, b)",
+    "active_parameter": 1
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "note": "=== is not allowed in a function body.",
+  "diagnostics": [
+    { "kind": "SignalInFunction" }
+  ]
+}

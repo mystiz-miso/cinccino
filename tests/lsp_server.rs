@@ -559,3 +559,113 @@ async fn test_signature_help_returns_null_outside_call() {
 
     client.shutdown_and_exit().await;
 }
+
+#[tokio::test]
+async fn test_initialize_advertises_formatting_capability() {
+    let mut client = LspClient::spawn().await;
+    let resp = client.initialize().await;
+    assert_eq!(
+        resp["result"]["capabilities"]["documentFormattingProvider"], true,
+        "server should advertise documentFormattingProvider",
+    );
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_formatting_returns_full_document_edit() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/format.circom";
+    let text = "template T(){signal input x;signal output y;y<==x;}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/formatting",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": 4, "insertSpaces": true }
+            })),
+        )
+        .await;
+
+    let edits = resp["result"].as_array().expect("expected edits array");
+    assert_eq!(edits.len(), 1, "expected a single full-document edit");
+    let new_text = edits[0]["newText"].as_str().unwrap();
+    assert!(new_text.contains("template T() {"));
+    assert!(new_text.contains("    signal input x;"));
+    assert!(new_text.contains("    y <== x;"));
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn test_formatting_preserves_comments_over_lsp() {
+    let mut client = LspClient::spawn().await;
+    client.initialize().await;
+
+    let uri = "file:///test/format_comments.circom";
+    let text = "\
+template T() {\n\
+    // doc for x\n\
+    signal input x; // inline\n\
+}\n\
+// end-of-file\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text
+                }
+            })),
+        )
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let resp = client
+        .request(
+            "textDocument/formatting",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "options": { "tabSize": 4, "insertSpaces": true }
+            })),
+        )
+        .await;
+
+    let edits = resp["result"].as_array().expect("expected edits array");
+    // Already-formatted enough that there might still be an edit; if
+    // there is, check the newText preserves comments. If not, the
+    // source already contains them.
+    let effective = if edits.is_empty() {
+        text.to_string()
+    } else {
+        edits[0]["newText"].as_str().unwrap().to_string()
+    };
+    assert!(effective.contains("// doc for x"));
+    assert!(effective.contains("// inline"));
+    assert!(effective.contains("// end-of-file"));
+
+    client.shutdown_and_exit().await;
+}

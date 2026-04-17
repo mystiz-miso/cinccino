@@ -1,5 +1,7 @@
 pub mod ast;
+pub mod circomlib_docs;
 pub mod constraint_checker;
+pub mod formatter;
 pub mod incremental;
 pub mod lexer;
 pub mod parser;
@@ -10,6 +12,7 @@ pub mod span;
 pub mod symbol;
 pub mod symbol_table;
 pub mod type_checker;
+pub mod underconstrained;
 pub mod visitor;
 pub mod walker;
 

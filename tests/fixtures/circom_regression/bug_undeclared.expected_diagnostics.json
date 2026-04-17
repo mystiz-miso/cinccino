@@ -1,0 +1,6 @@
+{
+  "note": "Reference to undeclared symbol.",
+  "diagnostics": [
+    { "kind": "UndeclaredSymbol" }
+  ]
+}

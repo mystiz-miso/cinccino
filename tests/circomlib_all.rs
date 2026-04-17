@@ -12,7 +12,7 @@ fn test_parse_all_circomlib_files() {
     for entry in fs::read_dir(&fixtures_dir).expect("fixtures dir") {
         let entry = entry.unwrap();
         let path = entry.path();
-        if path.extension().map_or(true, |e| e != "circom") {
+        if path.extension().is_none_or(|e| e != "circom") {
             continue;
         }
 

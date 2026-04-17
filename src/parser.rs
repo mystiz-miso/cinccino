@@ -2429,7 +2429,7 @@ mod tests {
     fn test_error_recovery_multiple_errors() {
         let (_file, errors) = parse_with_errors("template T() { signal a signal b signal c; }");
         // Parser should report multiple errors, not just the first
-        assert!(errors.len() >= 1);
+        assert!(!errors.is_empty());
     }
 
     #[test]

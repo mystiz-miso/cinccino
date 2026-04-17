@@ -1,0 +1,66 @@
+{
+  "name": "cinccino-circom",
+  "displayName": "Cinccino — Circom Language Support",
+  "description": "Circom language support powered by the cinccino LSP server.",
+  "version": "0.1.0",
+  "publisher": "cinccino",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Programming Languages", "Linters"],
+  "activationEvents": ["onLanguage:circom"],
+  "main": "./out/extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "circom",
+        "aliases": ["Circom", "circom"],
+        "extensions": [".circom"],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "circom",
+        "scopeName": "source.circom",
+        "path": "./syntaxes/circom.tmLanguage.json"
+      }
+    ],
+    "configuration": {
+      "type": "object",
+      "title": "Cinccino (Circom)",
+      "properties": {
+        "cinccino.serverPath": {
+          "type": "string",
+          "default": "cinccino-lsp",
+          "description": "Path to the cinccino-lsp executable. Resolved against PATH if not absolute."
+        },
+        "cinccino.trace.server": {
+          "type": "string",
+          "enum": ["off", "messages", "verbose"],
+          "default": "off",
+          "description": "Traces the communication between VS Code and the cinccino server."
+        },
+        "cinccino.libraryPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "description": "Extra directories to search for `include` targets (e.g. circomlib)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.4.0"
+  }
+}

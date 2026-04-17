@@ -137,6 +137,20 @@ pub enum DiagnosticKind {
     UnsafeSignalAssignment,
     /// Using signals inside a function body (signals only valid in templates).
     SignalInFunction,
+    /// A signal that is expected to carry a tag has lost it (e.g., assigning
+    /// an untagged signal to a `{binary}` output).
+    TagLoss,
+    /// An assignment to a tagged input signal is missing a required tag.
+    MissingRequiredTag,
+    /// Unknown signal on a component — either not an input/output or no such
+    /// template field exists.
+    UnknownComponentSignal,
+    /// An output signal of an instantiated component is never read (warning).
+    UnusedComponentOutput,
+    /// A template input was never driven by the caller (warning).
+    MissingComponentInput,
+    /// An output signal of the enclosing template is never assigned.
+    UnderconstrainedOutput,
 }
 
 #[cfg(test)]

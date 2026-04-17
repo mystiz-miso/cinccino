@@ -1,0 +1,6 @@
+{
+  "note": "<== on a variable should be =.",
+  "diagnostics": [
+    { "kind": "SignalAssignToVar" }
+  ]
+}

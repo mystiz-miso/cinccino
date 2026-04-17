@@ -1,0 +1,7 @@
+{
+  "references": {
+    "position": { "line": 3, "character": 10 },
+    "include_declaration": true,
+    "min_count": 2
+  }
+}

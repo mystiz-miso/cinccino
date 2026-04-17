@@ -4,6 +4,7 @@
 
 use tower_lsp::lsp_types::*;
 
+use crate::circomlib_docs;
 use crate::symbol::{ScopeId, SymbolKind};
 use crate::symbol_table::SymbolTable;
 
@@ -15,7 +16,26 @@ pub fn hover_info(
     name: &str,
     file_path: &str,
 ) -> Option<Hover> {
-    let symbol = table.lookup_with_includes(scope, name, file_path)?;
+    // If the cursor is on a well-known circomlib template name and the name
+    // is not shadowed by a local symbol, surface the curated documentation.
+    // Otherwise fall back to the in-tree definition-based hover.
+    let local = table.lookup_with_includes(scope, name, file_path);
+    if let Some(entry) = circomlib_docs::lookup(name) {
+        let is_shadowing_template = local
+            .map(|s| matches!(s.kind, SymbolKind::Template(_)))
+            .unwrap_or(false);
+        if !is_shadowing_template {
+            return Some(Hover {
+                contents: HoverContents::Markup(MarkupContent {
+                    kind: MarkupKind::Markdown,
+                    value: entry.markdown.to_string(),
+                }),
+                range: None,
+            });
+        }
+    }
+
+    let symbol = local?;
 
     let contents = match &symbol.kind {
         SymbolKind::Template(t) => {
@@ -29,6 +49,12 @@ pub fn hover_info(
             }
             if t.is_custom {
                 lines.push("**custom**".to_string());
+            }
+            // If a user-defined template happens to share a name with a
+            // documented circomlib template, append the curated docs as well.
+            if let Some(entry) = circomlib_docs::lookup(&symbol.name) {
+                lines.push("---".to_string());
+                lines.push(entry.markdown.to_string());
             }
             lines.join("\n\n")
         }
@@ -89,4 +115,66 @@ pub fn hover_info(
         }),
         range: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::parser;
+
+    fn extract_markdown(hover: Hover) -> String {
+        match hover.contents {
+            HoverContents::Markup(m) => m.value,
+            _ => String::new(),
+        }
+    }
+
+    #[test]
+    fn surfaces_circomlib_docs_for_known_template() {
+        let src = "";
+        let (ast, _) = parser::parse(src);
+        let mut table = SymbolTable::new();
+        table.index_file("main.circom", &ast);
+        let scope = table.file_scope("main.circom").unwrap();
+
+        let hover = hover_info(&table, scope, "Num2Bits", "main.circom")
+            .expect("Num2Bits hover should exist");
+        let md = extract_markdown(hover);
+        assert!(md.contains("Num2Bits"));
+        assert!(md.contains("Params"));
+    }
+
+    #[test]
+    fn local_template_overrides_circomlib_docs_but_appends() {
+        // A user-defined template named `IsZero` should still be the
+        // primary hover target, with circomlib docs appended.
+        let src = r#"
+            template IsZero() {
+                signal input in;
+                signal output out;
+                out <== 0;
+            }
+        "#;
+        let (ast, errors) = parser::parse(src);
+        assert!(errors.is_empty(), "parse errors: {errors:?}");
+        let mut table = SymbolTable::new();
+        table.index_file("main.circom", &ast);
+        let scope = table.file_scope("main.circom").unwrap();
+
+        let hover = hover_info(&table, scope, "IsZero", "main.circom").unwrap();
+        let md = extract_markdown(hover);
+        assert!(md.contains("template IsZero"));
+        assert!(md.contains("iff the input equals 0"));
+    }
+
+    #[test]
+    fn unknown_symbol_returns_none() {
+        let src = "";
+        let (ast, _) = parser::parse(src);
+        let mut table = SymbolTable::new();
+        table.index_file("main.circom", &ast);
+        let scope = table.file_scope("main.circom").unwrap();
+
+        assert!(hover_info(&table, scope, "NotARealSymbol", "main.circom").is_none());
+    }
 }

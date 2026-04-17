@@ -1,0 +1,6 @@
+{
+  "note": "= on a signal should be <== or <--.",
+  "diagnostics": [
+    { "kind": "VarAssignToSignal" }
+  ]
+}

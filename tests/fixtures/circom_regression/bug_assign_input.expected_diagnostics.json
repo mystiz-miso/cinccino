@@ -1,0 +1,6 @@
+{
+  "note": "Assigning to an input signal inside a template is invalid.",
+  "diagnostics": [
+    { "kind": "AssignToInput" }
+  ]
+}

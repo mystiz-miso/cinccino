@@ -433,6 +433,13 @@ impl SymbolTable {
         self.diagnostics.extend(diags);
     }
 
+    /// Run underconstrained-signal analysis on a file's AST and append
+    /// diagnostics.
+    pub fn check_underconstrained(&mut self, file_path: &str, ast: &File) {
+        let diags = crate::underconstrained::analyze(self, file_path, ast);
+        self.diagnostics.extend(diags);
+    }
+
     /// Check for undeclared symbol usage in a file's AST.
     pub fn check_undeclared(&mut self, file_path: &str, ast: &File) {
         let file_scope = match self.file_scope(file_path) {
