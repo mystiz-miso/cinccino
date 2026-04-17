@@ -983,3 +983,521 @@ async fn signature_help_outside_call_returns_null() {
 
     client.shutdown_and_exit().await;
 }
+
+// ───────────────────── semantic diagnostics ─────────────────────
+
+#[tokio::test]
+async fn diagnostics_type_error_assign_to_input() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/type_err.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    a <== 1;\n    b <== a;\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text,
+                }
+            })),
+        )
+        .await;
+
+    // Read messages until we get publishDiagnostics.
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = client.read_message().await;
+            if msg.get("method") == Some(&json!("textDocument/publishDiagnostics")) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for diagnostics");
+
+    let diagnostics = msg["params"]["diagnostics"]
+        .as_array()
+        .expect("expected diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "expected at least one semantic diagnostic"
+    );
+    // Should detect assigning to input signal 'a'.
+    let has_input_err = diagnostics
+        .iter()
+        .any(|d| d["message"].as_str().unwrap_or("").contains("input signal"));
+    assert!(
+        has_input_err,
+        "expected input signal error: {diagnostics:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn diagnostics_constraint_warning_unsafe_assign() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/unsafe.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <-- a;\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text,
+                }
+            })),
+        )
+        .await;
+
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = client.read_message().await;
+            if msg.get("method") == Some(&json!("textDocument/publishDiagnostics")) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for diagnostics");
+
+    let diagnostics = msg["params"]["diagnostics"]
+        .as_array()
+        .expect("expected diagnostics array");
+    assert!(
+        !diagnostics.is_empty(),
+        "expected unsafe assignment warning"
+    );
+    // Should be a warning (severity 2), not an error.
+    let has_warning = diagnostics
+        .iter()
+        .any(|d| d["severity"].as_i64() == Some(2));
+    assert!(has_warning, "expected warning severity: {diagnostics:?}");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn diagnostics_clean_file_no_errors() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/clean.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <== a;\n}\n";
+
+    client
+        .notify(
+            "textDocument/didOpen",
+            Some(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "circom",
+                    "version": 1,
+                    "text": text,
+                }
+            })),
+        )
+        .await;
+
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let msg = client.read_message().await;
+            if msg.get("method") == Some(&json!("textDocument/publishDiagnostics")) {
+                return msg;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for diagnostics");
+
+    let diagnostics = msg["params"]["diagnostics"]
+        .as_array()
+        .expect("expected diagnostics array");
+    assert!(
+        diagnostics.is_empty(),
+        "expected no diagnostics for clean file: {diagnostics:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── hover ─────────────────────
+
+#[tokio::test]
+async fn hover_on_template_name() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/hover.circom";
+    let text = "template Adder(n) {\n    signal input a;\n    signal output b;\n    b <== a;\n}\ntemplate Main() {\n    component c = Adder(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Hover on "Adder" in component instantiation (line 6, col 20).
+    let resp = client
+        .request(
+            "textDocument/hover",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 6, "character": 20 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected hover result, got null");
+    let value = result["contents"]["value"].as_str().unwrap();
+    assert!(
+        value.contains("template Adder(n)"),
+        "expected template signature: {value}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn hover_on_signal_name() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/hover_sig.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <== a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Hover on "a" in `b <== a;` (line 3, col 10).
+    let resp = client
+        .request(
+            "textDocument/hover",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 10 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected hover result for signal");
+    let value = result["contents"]["value"].as_str().unwrap();
+    assert!(
+        value.contains("signal input"),
+        "expected signal info: {value}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn hover_on_function_name() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/hover_fn.circom";
+    let text = "function nbits(n) {\n    return n;\n}\ntemplate T() {\n    var x = nbits(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Hover on "nbits" in `nbits(4)` (line 4, col 14).
+    let resp = client
+        .request(
+            "textDocument/hover",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 4, "character": 14 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected hover result for function");
+    let value = result["contents"]["value"].as_str().unwrap();
+    assert!(
+        value.contains("function nbits(n)"),
+        "expected function signature: {value}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn hover_on_empty_space_returns_null() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/hover_none.circom";
+    let text = "template T() {\n    signal input a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Hover on whitespace (line 1, col 0 = spaces).
+    let resp = client
+        .request(
+            "textDocument/hover",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 0 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(result.is_null(), "expected null for empty space hover");
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn hover_returns_null_for_unknown_uri() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let resp = client
+        .request(
+            "textDocument/hover",
+            Some(json!({
+                "textDocument": { "uri": "file:///test/unknown.circom" },
+                "position": { "line": 0, "character": 0 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(result.is_null(), "expected null for unknown URI");
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── go to definition ─────────────────────
+
+#[tokio::test]
+async fn goto_definition_template() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/goto_def.circom";
+    let text = "template Adder(n) {\n    signal input a;\n    signal output b;\n    b <== a;\n}\ntemplate Main() {\n    component c = Adder(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Go to definition on "Adder" in `Adder(4)` (line 6, col 20).
+    let resp = client
+        .request(
+            "textDocument/definition",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 6, "character": 20 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected definition location");
+    assert_eq!(result["uri"], uri);
+    // Template name "Adder" is on line 0.
+    assert_eq!(result["range"]["start"]["line"], 0);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn goto_definition_signal() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/goto_sig.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <== a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Go to definition on "a" in `b <== a;` (line 3, col 10).
+    let resp = client
+        .request(
+            "textDocument/definition",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 10 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected definition location for signal");
+    assert_eq!(result["uri"], uri);
+    // Signal "a" is declared on line 1.
+    assert_eq!(result["range"]["start"]["line"], 1);
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn goto_definition_unknown_symbol_returns_null() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/goto_unknown.circom";
+    let text = "template T() {\n    signal output b;\n    b <== unknown_thing;\n}\n";
+    client.open_doc(uri, text).await;
+
+    let resp = client
+        .request(
+            "textDocument/definition",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 2, "character": 12 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(
+        result.is_null(),
+        "expected null for unknown symbol: {result}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── find references ─────────────────────
+
+#[tokio::test]
+async fn references_finds_all_usages() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/refs.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <== a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Find references for "a" (line 3, col 10).
+    let resp = client
+        .request(
+            "textDocument/references",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 10 },
+                "context": { "includeDeclaration": true }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    // "a" appears: declaration (line 1) + usage (line 3) = 2
+    assert!(
+        result.len() >= 2,
+        "expected at least 2 references for 'a': {result:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn references_exclude_declaration() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/refs_excl.circom";
+    let text = "template T() {\n    signal input a;\n    signal output b;\n    b <== a;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Find references for "a" without declaration.
+    let resp = client
+        .request(
+            "textDocument/references",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 1, "character": 17 },
+                "context": { "includeDeclaration": false }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    // With declaration excluded, only the usage in `b <== a;` should remain.
+    // Note: "a" appears in "signal input a;" declaration and in "b <== a;".
+    // The declaration position should be excluded.
+    assert!(
+        !result.is_empty(),
+        "expected at least one reference excluding declaration"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn references_unknown_symbol_returns_null() {
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/refs_unknown.circom";
+    let text = "template T() {\n    signal output b;\n    b <== 1;\n}\n";
+    client.open_doc(uri, text).await;
+
+    // Find references for "1" (a number, not an identifier).
+    let resp = client
+        .request(
+            "textDocument/references",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 2, "character": 10 },
+                "context": { "includeDeclaration": true }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(
+        result.is_null(),
+        "expected null for non-identifier: {result}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+// ───────────────────── initialize capabilities ─────────────────────
+
+#[tokio::test]
+async fn initialize_advertises_hover_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["hoverProvider"], true,
+        "should advertise hover"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn initialize_advertises_references_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["referencesProvider"], true,
+        "should advertise references"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn initialize_advertises_definition_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["definitionProvider"], true,
+        "should advertise definition"
+    );
+
+    client.shutdown_and_exit().await;
+}

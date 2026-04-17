@@ -97,31 +97,22 @@ impl<'a> TypeChecker<'a> {
             StatementKind::Assignment(a) => {
                 self.check_assignment(a, stmt.span);
             }
-            StatementKind::ConstraintEq(_) => {
-                // === is only valid in templates, not functions.
-                if self.context == CheckContext::Function {
-                    self.diagnostics.push(SymbolDiagnostic {
-                        span: stmt.span,
-                        message: "constraint equality '===' cannot be used in a function"
-                            .to_string(),
-                        kind: DiagnosticKind::SignalInFunction,
-                        file: self.file.clone(),
-                    });
-                }
-                // Constraint equality operates on signal expressions — type
-                // validation is handled by the constraint checker (quadratic
-                // form). No additional checks needed here beyond the
-                // function-context check above.
+            StatementKind::ConstraintEq(_) if self.context == CheckContext::Function => {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: stmt.span,
+                    message: "constraint equality '===' cannot be used in a function".to_string(),
+                    kind: DiagnosticKind::SignalInFunction,
+                    file: self.file.clone(),
+                });
             }
-            StatementKind::SignalDecl(s) => {
-                if self.context == CheckContext::Function {
-                    self.diagnostics.push(SymbolDiagnostic {
-                        span: s.span,
-                        message: "signal declarations are not allowed in functions".to_string(),
-                        kind: DiagnosticKind::SignalInFunction,
-                        file: self.file.clone(),
-                    });
-                }
+            StatementKind::ConstraintEq(_) => {}
+            StatementKind::SignalDecl(s) if self.context == CheckContext::Function => {
+                self.diagnostics.push(SymbolDiagnostic {
+                    span: s.span,
+                    message: "signal declarations are not allowed in functions".to_string(),
+                    kind: DiagnosticKind::SignalInFunction,
+                    file: self.file.clone(),
+                });
             }
             StatementKind::ComponentDecl(c) => {
                 for entry in &c.names {
@@ -196,24 +187,22 @@ impl<'a> TypeChecker<'a> {
             .lookup_with_includes(self.current_scope, &name, &self.file)
         {
             match &sym.kind {
-                SymbolKind::Signal(sig) => {
-                    if sig.kind == SignalKind::Input && self.context == CheckContext::Template {
-                        let op_str = match op {
-                            AssignOp::SafeLeft => "<==",
-                            AssignOp::UnsafeLeft => "<--",
-                            AssignOp::SafeRight => "==>",
-                            AssignOp::UnsafeRight => "-->",
-                            _ => "signal assign",
-                        };
-                        self.diagnostics.push(SymbolDiagnostic {
-                            span: expr.span,
-                            message: format!(
-                                "cannot assign to input signal '{name}' with '{op_str}'"
-                            ),
-                            kind: DiagnosticKind::AssignToInput,
-                            file: self.file.clone(),
-                        });
-                    }
+                SymbolKind::Signal(sig)
+                    if sig.kind == SignalKind::Input && self.context == CheckContext::Template =>
+                {
+                    let op_str = match op {
+                        AssignOp::SafeLeft => "<==",
+                        AssignOp::UnsafeLeft => "<--",
+                        AssignOp::SafeRight => "==>",
+                        AssignOp::UnsafeRight => "-->",
+                        _ => "signal assign",
+                    };
+                    self.diagnostics.push(SymbolDiagnostic {
+                        span: expr.span,
+                        message: format!("cannot assign to input signal '{name}' with '{op_str}'"),
+                        kind: DiagnosticKind::AssignToInput,
+                        file: self.file.clone(),
+                    });
                 }
                 SymbolKind::Variable | SymbolKind::Parameter => {
                     let op_str = match op {

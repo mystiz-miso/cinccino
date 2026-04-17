@@ -2,6 +2,7 @@ mod backend;
 mod completion;
 mod document;
 pub mod document_symbol;
+pub mod hover;
 pub mod signature_help;
 
 pub use backend::CinccinoBackend;

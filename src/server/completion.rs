@@ -531,7 +531,7 @@ fn detect_dot_receiver(before: &str) -> Option<String> {
 /// This is more reliable than walking the symbol table's scope tree because
 /// AST items carry the full span (including body), whereas symbol spans only
 /// cover the name.
-fn find_scope_at_offset_ast(
+pub(crate) fn find_scope_at_offset_ast(
     ast: &crate::ast::File,
     offset: usize,
     table: &SymbolTable,
