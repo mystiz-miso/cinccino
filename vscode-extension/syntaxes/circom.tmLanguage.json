@@ -29,7 +29,7 @@
     "keywords": {
       "patterns": [
         {
-          "match": "\\b(pragma|include|template|function|component|main|public|private|parallel|return|if|else|for|while|do|assert|log|custom_templates|bus)\\b",
+          "match": "\\b(pragma|include|template|function|component|main|public|parallel|custom|extern|return|if|else|for|while|assert|log|custom_templates|bus)\\b",
           "name": "keyword.control.circom"
         }
       ]
@@ -73,7 +73,11 @@
     "operators": {
       "patterns": [
         {
-          "match": "<==|==>|<--|-->|===|==|!=|<=|>=|<<|>>|&&|\\|\\||=>|->",
+          "match": "<==|==>|<--|-->|===|\\*\\*=|<<=|>>=|\\+\\+|--|\\+=|-=|\\*=|/=|\\\\=|%=|&=|\\|=|\\^=|==|!=|<=|>=|<<|>>|&&|\\|\\||=>|->|\\*\\*",
+          "name": "keyword.operator.circom"
+        },
+        {
+          "match": "[+\\-*/%&|^~!=?:]",
           "name": "keyword.operator.circom"
         }
       ]
