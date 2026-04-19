@@ -42,6 +42,7 @@ use crate::symbol::*;
 use crate::symbol_table::SymbolTable;
 
 /// Run underconstrained-signal detection against a file's AST.
+#[tracing::instrument(level = "debug", skip(table, ast), fields(file = %file_path))]
 pub fn analyze(table: &SymbolTable, file_path: &str, ast: &File) -> Vec<SymbolDiagnostic> {
     let file_scope = match table.file_scope(file_path) {
         Some(s) => s,

@@ -20,6 +20,7 @@ use crate::symbol_table::SymbolTable;
 /// Run type checks on a file's AST using the populated symbol table.
 ///
 /// Returns diagnostics for any type errors found.
+#[tracing::instrument(level = "debug", skip(table, ast), fields(file = %file_path))]
 pub fn check_types(table: &SymbolTable, file_path: &str, ast: &File) -> Vec<SymbolDiagnostic> {
     let file_scope = match table.file_scope(file_path) {
         Some(s) => s,
@@ -34,6 +35,8 @@ pub fn check_types(table: &SymbolTable, file_path: &str, ast: &File) -> Vec<Symb
         context: CheckContext::File,
     };
     checker.check_file(ast);
+    let n = checker.diagnostics.len();
+    tracing::debug!(diagnostics = n, "check_types complete");
     checker.diagnostics
 }
 
