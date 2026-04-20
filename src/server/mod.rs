@@ -1,4 +1,5 @@
 mod backend;
+pub mod call_hierarchy;
 pub mod code_action;
 mod completion;
 mod document;

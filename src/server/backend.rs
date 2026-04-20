@@ -3,6 +3,7 @@ use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
 use tower_lsp::{Client, LanguageServer};
 
+use super::call_hierarchy as ch;
 use super::code_action as ca;
 use super::completion;
 use super::document_symbol;
@@ -645,6 +646,67 @@ impl LanguageServer for CinccinoBackend {
         };
         Ok(fmt_handler::format_document(&text, &params.options))
     }
+
+    /// Resolve the caller at a cursor position (#383). Returns a
+    /// single-item list whose CallHierarchyItem carries the caller's
+    /// definition range — the client then threads that item back
+    /// through `callHierarchy/outgoingCalls` below.
+    #[tracing::instrument(
+        level = "debug",
+        skip_all,
+        fields(uri = %params.text_document_position_params.text_document.uri),
+    )]
+    async fn prepare_call_hierarchy(
+        &self,
+        params: CallHierarchyPrepareParams,
+    ) -> Result<Option<Vec<CallHierarchyItem>>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let Some(offset) = position_to_byte_offset(&text, position) else {
+            return Ok(None);
+        };
+        let (file, _errors) = parser::parse(&text);
+        let Some(caller) = ch::caller_at_offset(&file, offset) else {
+            return Ok(None);
+        };
+        let line_index = LineIndex::new(&text);
+        Ok(Some(vec![ch::caller_to_item(&caller, uri, &line_index)]))
+    }
+
+    /// Return every outgoing call from the caller named in `item`
+    /// (#383). Callee ranges point at the call site in the caller's
+    /// body; callee URIs point at the caller's file — cross-file
+    /// resolution is the indexer's bare-name resolver's job.
+    #[tracing::instrument(level = "debug", skip_all, fields(uri = %params.item.uri, name = %params.item.name))]
+    async fn outgoing_calls(
+        &self,
+        params: CallHierarchyOutgoingCallsParams,
+    ) -> Result<Option<Vec<CallHierarchyOutgoingCall>>> {
+        let uri = params.item.uri.clone();
+        let text = match self.documents.get_text(&uri) {
+            Some(t) => t,
+            None => return Ok(None),
+        };
+        let (file, _errors) = parser::parse(&text);
+        let kind = match params.item.kind {
+            SymbolKind::CLASS => ch::CallerKind::Template,
+            _ => ch::CallerKind::Function,
+        };
+        let outgoing = ch::outgoing_calls_for(&file, &params.item.name, kind);
+        if outgoing.is_empty() {
+            return Ok(Some(Vec::new()));
+        }
+        let line_index = LineIndex::new(&text);
+        let calls = outgoing
+            .iter()
+            .map(|o| ch::outgoing_to_call(o, uri.clone(), &line_index, None))
+            .collect();
+        Ok(Some(calls))
+    }
 }
 
 /// Scan `doc_text` for every word-boundary occurrence of `name` and push
@@ -722,6 +784,7 @@ fn server_capabilities() -> ServerCapabilities {
         rename_provider: Some(OneOf::Left(true)),
         code_action_provider: Some(CodeActionProviderCapability::Simple(true)),
         document_formatting_provider: Some(OneOf::Left(true)),
+        call_hierarchy_provider: Some(CallHierarchyServerCapability::Simple(true)),
         workspace: Some(WorkspaceServerCapabilities {
             workspace_folders: Some(WorkspaceFoldersServerCapabilities {
                 supported: Some(true),
