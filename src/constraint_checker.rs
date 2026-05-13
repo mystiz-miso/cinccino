@@ -136,12 +136,15 @@ impl<'a> ConstraintChecker<'a> {
     fn collect_constrained_in_stmt(&self, stmt: &Statement, constrained: &mut HashSet<String>) {
         match &stmt.kind {
             StatementKind::ConstraintEq(c) => {
-                if let Some(name) = c.lhs.extract_base_name() {
-                    constrained.insert(name);
-                }
-                if let Some(name) = c.rhs.extract_base_name() {
-                    constrained.insert(name);
-                }
+                // Every signal *mentioned* in the constraint counts as
+                // constrained, not just bare LHS/RHS references. The
+                // canonical Circom pattern `sig <-- expr; sig * x === y;`
+                // buries `sig` inside a product on one side of the `===`,
+                // so the old `extract_base_name`-only logic missed it
+                // and produced false-positive "no corresponding `===`"
+                // warnings (see montgomery.circom's `lamda`).
+                collect_idents_in_expr(&c.lhs, constrained);
+                collect_idents_in_expr(&c.rhs, constrained);
             }
             StatementKind::Assignment(a) => {
                 // <== also generates a constraint
@@ -280,7 +283,7 @@ impl<'a> ConstraintChecker<'a> {
         if ld > Degree::Constant && rd == Degree::Constant {
             // If exponent is a known number, compute degree
             if let ExpressionKind::Number(n) = r.kind.as_ref() {
-                if let Ok(exp) = n.parse::<u32>() {
+                if let Some(exp) = crate::parser::parse_number_literal_u32(n) {
                     return Degree::from_u32(ld.as_u32().saturating_mul(exp));
                 }
             }
@@ -392,6 +395,60 @@ impl<'a> ConstraintChecker<'a> {
             .lookup_with_includes(self.current_scope, name, &self.file)
             .map(|s| matches!(s.kind, SymbolKind::Signal(_) | SymbolKind::Component(_)))
             .unwrap_or(false)
+    }
+}
+
+/// Collect every base identifier mentioned anywhere in `expr`. The
+/// caller filters out non-signals at the warning site, so this is
+/// intentionally over-eager.
+fn collect_idents_in_expr(expr: &Expression, out: &mut HashSet<String>) {
+    match expr.kind.as_ref() {
+        ExpressionKind::Ident(name) => {
+            out.insert(name.clone());
+        }
+        ExpressionKind::Index(base, idx) => {
+            collect_idents_in_expr(base, out);
+            collect_idents_in_expr(idx, out);
+        }
+        ExpressionKind::Member(base, _) => collect_idents_in_expr(base, out),
+        ExpressionKind::Unary(_, e) => collect_idents_in_expr(e, out),
+        ExpressionKind::Binary(l, _, r) => {
+            collect_idents_in_expr(l, out);
+            collect_idents_in_expr(r, out);
+        }
+        ExpressionKind::Ternary(c, t, f) => {
+            collect_idents_in_expr(c, out);
+            collect_idents_in_expr(t, out);
+            collect_idents_in_expr(f, out);
+        }
+        ExpressionKind::Call(callee, args) => {
+            collect_idents_in_expr(callee, out);
+            for a in args {
+                collect_idents_in_expr(a, out);
+            }
+        }
+        ExpressionKind::AnonymousComp(ac) => {
+            collect_idents_in_expr(&ac.template, out);
+            for a in &ac.template_args {
+                collect_idents_in_expr(a, out);
+            }
+            for inp in &ac.inputs {
+                match inp {
+                    AnonCompInput::Positional(e) | AnonCompInput::Named(_, e) => {
+                        collect_idents_in_expr(e, out);
+                    }
+                }
+            }
+        }
+        ExpressionKind::ArrayLit(elems) => {
+            for e in elems {
+                collect_idents_in_expr(e, out);
+            }
+        }
+        ExpressionKind::Paren(e) | ExpressionKind::Parallel(e) => {
+            collect_idents_in_expr(e, out);
+        }
+        ExpressionKind::Number(_) | ExpressionKind::Underscore | ExpressionKind::Error => {}
     }
 }
 
@@ -576,6 +633,36 @@ mod tests {
         );
         let warnings = diags_of_kind(&diags, DiagnosticKind::UnsafeSignalAssignment);
         assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn no_warning_when_constraint_buries_signal_in_product() {
+        // Regression: montgomery.circom `lamda` pattern. `<--` followed
+        // by a `===` where the assigned signal is multiplied by another
+        // expression instead of being a bare LHS/RHS. Pre-fix, the
+        // matcher only looked at `extract_base_name` on each side of the
+        // `===`, which returned None for the Binary node and missed
+        // the constraint.
+        let diags = parse_and_check(
+            r#"
+            template MontgomeryAddLike() {
+                signal input in1[2];
+                signal input in2[2];
+                signal lamda;
+                lamda <-- (in2[1] - in1[1]) / (in2[0] - in1[0]);
+                lamda * (in2[0] - in1[0]) === (in2[1] - in1[1]);
+            }
+            "#,
+        );
+        let warnings: Vec<&SymbolDiagnostic> =
+            diags_of_kind(&diags, DiagnosticKind::UnsafeSignalAssignment)
+                .into_iter()
+                .filter(|d| d.message.contains("'lamda'"))
+                .collect();
+        assert!(
+            warnings.is_empty(),
+            "lamda is constrained by `lamda * (in2[0]-in1[0]) === ...`; should not warn: {warnings:?}"
+        );
     }
 
     #[test]

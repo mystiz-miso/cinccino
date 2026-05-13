@@ -377,9 +377,9 @@ impl Parser {
         match self.peek() {
             Some(Token::NumberLit(_)) => {
                 if let Token::NumberLit(s) = self.advance().unwrap().token.clone() {
-                    match s.parse() {
-                        Ok(n) => n,
-                        Err(_) => {
+                    match parse_number_literal_u32(&s) {
+                        Some(n) => n,
+                        None => {
                             self.error(format!("version number '{}' overflows u32", s));
                             0
                         }
@@ -1710,6 +1710,18 @@ impl Parser {
     }
 }
 
+/// Parse a Circom numeric literal string into a `u32`. Handles both
+/// decimal (`123`) and hex (`0x6a09e667` / `0X...`) forms; returns
+/// `None` if the value overflows u32 or the string is malformed. The
+/// lexer ensures only these two shapes ever reach us.
+pub(crate) fn parse_number_literal_u32(s: &str) -> Option<u32> {
+    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u32::from_str_radix(rest, 16).ok()
+    } else {
+        s.parse().ok()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2293,6 +2305,65 @@ mod tests {
             },
             _ => panic!("expected function"),
         }
+    }
+
+    #[test]
+    fn test_hex_number_literal_in_array() {
+        // Regression: circomlib's sha256/constants.circom uses hex
+        // literals; pre-fix the lexer split `0x6a09e667` into
+        // `0` + `x6a09e667` and the parser reported
+        // `expected RBracket, found Ident(...)`.
+        let src = r#"
+            template H() {
+                signal output out;
+                var c[8] = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                            0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+                out <== c[0];
+            }
+        "#;
+        let file = parse_ok(src);
+        match &file.items[0] {
+            Item::TemplateDef(t) => {
+                // The `var c[8] = [...];` is statement 1 (after the signal
+                // output decl); validate it parsed as an array of 8 numbers.
+                let stmts = &t.body.stmts;
+                let init = stmts
+                    .iter()
+                    .find_map(|s| match &s.kind {
+                        StatementKind::VarDecl(v) => v.names[0].init.clone(),
+                        _ => None,
+                    })
+                    .expect("expected a var with initializer");
+                match init.kind.as_ref() {
+                    ExpressionKind::ArrayLit(elems) => {
+                        assert_eq!(elems.len(), 8);
+                        for (i, e) in elems.iter().enumerate() {
+                            match e.kind.as_ref() {
+                                ExpressionKind::Number(n) => {
+                                    assert!(
+                                        n.starts_with("0x"),
+                                        "elem {} not hex: {n}",
+                                        i
+                                    );
+                                }
+                                other => panic!("elem {i} not a Number: {other:?}"),
+                            }
+                        }
+                    }
+                    other => panic!("expected array literal, got {other:?}"),
+                }
+            }
+            _ => panic!("expected template"),
+        }
+    }
+
+    #[test]
+    fn test_parse_number_literal_u32_hex_and_decimal() {
+        assert_eq!(parse_number_literal_u32("42"), Some(42));
+        assert_eq!(parse_number_literal_u32("0x6a09e667"), Some(0x6a09e667));
+        assert_eq!(parse_number_literal_u32("0X6A09E667"), Some(0x6a09e667));
+        // Overflow:
+        assert_eq!(parse_number_literal_u32("99999999999"), None);
     }
 
     // ── Tuple assignment tests ──────────────────────────────────

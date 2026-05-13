@@ -55,6 +55,9 @@ pub enum Token {
     Extern,
 
     // ── Literals ──────────────────────────────────────────────
+    // Hex literal first so logos's longest-match prefers it for `0x...`.
+    // Decimal fallback covers everything else.
+    #[regex(r"0[xX][0-9a-fA-F]+", |lex| lex.slice().to_string())]
     #[regex(r"[0-9]+", |lex| lex.slice().to_string())]
     NumberLit(String),
 
