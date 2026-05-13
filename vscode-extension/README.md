@@ -25,9 +25,10 @@ Or search for *Cinccino — Circom Language Support* in the Extensions
 view (`Cmd/Ctrl+Shift+X`).
 
 The first time you open a `.circom` file, the extension will detect
-that the `cinccino-lsp` binary is missing and offer to install it via
-`cargo install` (takes ~2 minutes the first time). Click **Install**
-and the LSP starts as soon as it's done.
+that the `cinccino-lsp` binary is missing and install it via
+`cargo install` automatically. Build progress streams into the
+**Cinccino** output channel; the LSP starts as soon as the build
+finishes (takes ~2 minutes the first time).
 
 ### Prerequisite: Rust toolchain
 

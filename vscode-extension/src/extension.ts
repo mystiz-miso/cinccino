@@ -23,7 +23,7 @@ const SERVER_REPO = "https://github.com/mystiz-miso/cinccino.git";
 
 let client: LanguageClient | undefined;
 let log: OutputChannel | undefined;
-let installPromptSuppressed = false;
+let autoInstallAttempted = false;
 
 export async function activate(context: ExtensionContext): Promise<void> {
   log = window.createOutputChannel("Cinccino");
@@ -129,36 +129,37 @@ async function stopServer(): Promise<void> {
 /**
  * Confirm the binary referenced by `rawPath` is locatable. For absolute or
  * separator-bearing paths we stat the file directly; for bare names we ask
- * the shell via `which`. If missing, prompt the user to auto-install via
- * cargo (one-time per session unless they choose `Install`).
+ * the shell via `which`. If missing, attempt cargo install silently (one
+ * attempt per session) — matching the install-on-first-use UX of
+ * rust-analyzer, gopls, etc.
+ *
+ * Two exceptions to the silent-install path:
+ *   1. The user configured an *absolute* `cinccino.serverPath`. We respect
+ *      their explicit choice and surface an error rather than installing
+ *      somewhere they didn't ask for.
+ *   2. The `cargo` binary itself is missing. We can't bootstrap a Rust
+ *      toolchain without sudo / shell-rc edits, so we point at rustup.rs
+ *      and leave the install to the user.
  */
 async function ensureServerAvailable(rawPath: string): Promise<boolean> {
   if (await binaryResolves(rawPath)) return true;
 
-  if (installPromptSuppressed) {
-    log?.appendLine("binary missing; prompt previously dismissed this session");
-    return false;
-  }
-
-  const choice = await window.showWarningMessage(
-    `cinccino-lsp not found (searched for "${rawPath}"). Install it now via cargo? This takes ~2 minutes.`,
-    "Install",
-    "Configure path…",
-    "Dismiss",
-  );
-
-  if (choice === "Configure path…") {
-    await commands.executeCommand(
-      "workbench.action.openSettings",
-      "cinccino.serverPath",
+  if (path.isAbsolute(rawPath)) {
+    log?.appendLine(`absolute serverPath "${rawPath}" does not exist; not auto-installing`);
+    window.showErrorMessage(
+      `cinccino.serverPath points at "${rawPath}", which doesn't exist. ` +
+        `Either fix the setting or clear it to fall back to the default.`,
     );
     return false;
   }
-  if (choice !== "Install") {
-    installPromptSuppressed = true;
+
+  if (autoInstallAttempted) {
+    log?.appendLine("binary missing and auto-install already attempted this session");
     return false;
   }
+  autoInstallAttempted = true;
 
+  log?.appendLine("cinccino-lsp not found on PATH; attempting auto-install via cargo");
   const ok = await runCargoInstall();
   return ok && (await binaryResolves(rawPath));
 }

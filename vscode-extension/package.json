@@ -2,7 +2,7 @@
   "name": "cinccino-circom",
   "displayName": "Cinccino — Circom Language Support",
   "description": "Circom language support powered by the cinccino LSP server.",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "publisher": "samueltangz",
   "license": "MIT",
   "repository": {
