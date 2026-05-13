@@ -15,22 +15,7 @@ developers:
 
 ## Installation
 
-### 1. Install the server binary
-
-Build cinccino from source and place `cinccino-lsp` on your `$PATH`:
-
-```bash
-cargo install --git https://github.com/mystiz-miso/cinccino.git --bin cinccino-lsp
-```
-
-(Or clone and `cargo install --path .` if you'd prefer a checkout.)
-
-The binary lands in `~/.cargo/bin/cinccino-lsp`. Make sure that directory
-is on `$PATH`.
-
-### 2. Install the extension
-
-From the VS Code Marketplace:
+Install the extension from the VS Code Marketplace:
 
 ```bash
 code --install-extension samueltangz.cinccino-circom
@@ -38,6 +23,31 @@ code --install-extension samueltangz.cinccino-circom
 
 Or search for *Cinccino — Circom Language Support* in the Extensions
 view (`Cmd/Ctrl+Shift+X`).
+
+The first time you open a `.circom` file, the extension will detect
+that the `cinccino-lsp` binary is missing and offer to install it via
+`cargo install` (takes ~2 minutes the first time). Click **Install**
+and the LSP starts as soon as it's done.
+
+### Prerequisite: Rust toolchain
+
+Auto-install requires `cargo` on `$PATH`. If you don't have Rust:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+```
+
+You can also pre-install the server manually and skip the prompt:
+
+```bash
+cargo install --git https://github.com/mystiz-miso/cinccino.git --bin cinccino-lsp
+ln -sf "$HOME/.cargo/bin/cinccino-lsp" "$HOME/.local/bin/cinccino-lsp"
+```
+
+To re-run the auto-installer later (e.g. to pick up a new version of
+the server), use the command palette: **Cinccino: Install or Update
+Server**.
 
 #### Building from source
 
