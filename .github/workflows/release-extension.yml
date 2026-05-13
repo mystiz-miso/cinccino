@@ -1,0 +1,159 @@
+name: Release VSCode Extension
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build platform .vsix's but skip the publish step"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-binaries:
+    name: Build cinccino-lsp (${{ matrix.vscode-target }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode-target: linux-x64
+            rust-target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: false
+          - vscode-target: linux-arm64
+            rust-target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: true
+          - vscode-target: darwin-x64
+            rust-target: x86_64-apple-darwin
+            runner: macos-13
+            use-cross: false
+          - vscode-target: darwin-arm64
+            rust-target: aarch64-apple-darwin
+            runner: macos-14
+            use-cross: false
+          - vscode-target: win32-x64
+            rust-target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            use-cross: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.rust-target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cross
+
+      - name: Build (native)
+        if: ${{ !matrix.use-cross }}
+        run: cargo build --release --bin cinccino-lsp --target ${{ matrix.rust-target }}
+
+      - name: Build (cross)
+        if: matrix.use-cross
+        run: cross build --release --bin cinccino-lsp --target ${{ matrix.rust-target }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p staged
+          if [[ "${{ matrix.vscode-target }}" == "win32-x64" ]]; then
+            cp "target/${{ matrix.rust-target }}/release/cinccino-lsp.exe" staged/
+          else
+            cp "target/${{ matrix.rust-target }}/release/cinccino-lsp" staged/
+            chmod +x staged/cinccino-lsp
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cinccino-lsp-${{ matrix.vscode-target }}
+          path: staged/*
+          if-no-files-found: error
+
+  publish:
+    name: Package + publish (${{ matrix.vscode-target }})
+    needs: build-binaries
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        vscode-target: [linux-x64, linux-arm64, darwin-x64, darwin-arm64, win32-x64]
+    defaults:
+      run:
+        working-directory: vscode-extension
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: vscode-extension/package-lock.json
+
+      - run: npm ci
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: cinccino-lsp-${{ matrix.vscode-target }}
+          path: vscode-extension/server/${{ matrix.vscode-target }}
+
+      - name: Make binary executable
+        if: matrix.vscode-target != 'win32-x64'
+        run: chmod +x server/${{ matrix.vscode-target }}/cinccino-lsp
+
+      - run: npm run compile
+
+      - name: Package .vsix
+        run: |
+          npx @vscode/vsce package --no-dependencies --target ${{ matrix.vscode-target }} \
+            --out cinccino-circom-${{ matrix.vscode-target }}.vsix
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix-${{ matrix.vscode-target }}
+          path: vscode-extension/cinccino-circom-${{ matrix.vscode-target }}.vsix
+
+      - name: Publish to VS Code Marketplace
+        if: github.event_name == 'push' || inputs.dry_run == false
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}
+        run: |
+          npx @vscode/vsce publish --no-dependencies --target ${{ matrix.vscode-target }} \
+            --packagePath cinccino-circom-${{ matrix.vscode-target }}.vsix
+
+      - name: Publish to Open VSX
+        if: (github.event_name == 'push' || inputs.dry_run == false) && env.OVSX_PAT != ''
+        env:
+          OVSX_PAT: ${{ secrets.OVSX_PAT }}
+        run: npx ovsx publish cinccino-circom-${{ matrix.vscode-target }}.vsix -p "$OVSX_PAT" --target ${{ matrix.vscode-target }}
+
+  github-release:
+    name: Attach .vsix's to GitHub Release
+    needs: publish
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: vsix-*
+          path: vsix-bundles
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: vsix-bundles/*.vsix
+          generate_release_notes: true

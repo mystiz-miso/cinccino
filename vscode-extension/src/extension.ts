@@ -20,14 +20,17 @@ import {
 } from "vscode-languageclient/node";
 
 const SERVER_REPO = "https://github.com/mystiz-miso/cinccino.git";
+const DEFAULT_SERVER_PATH = "cinccino-lsp";
 
 let client: LanguageClient | undefined;
 let log: OutputChannel | undefined;
+let extensionRoot: string | undefined;
 let autoInstallAttempted = false;
 
 export async function activate(context: ExtensionContext): Promise<void> {
   log = window.createOutputChannel("Cinccino");
   context.subscriptions.push(log);
+  extensionRoot = context.extensionPath;
   log.appendLine(`[${new Date().toISOString()}] activate() entered`);
 
   context.subscriptions.push(
@@ -37,7 +40,9 @@ export async function activate(context: ExtensionContext): Promise<void> {
       await startServer(context);
     }),
     commands.registerCommand("cinccino.installServer", async () => {
-      // Manual entry point — always attempts install regardless of prompt-suppression state.
+      // Manual entry point — always attempts cargo install. Useful on the
+      // generic .vsix (no bundled binary) or when you want to upgrade the
+      // server independently.
       const ok = await runCargoInstall();
       if (ok) {
         await stopServer();
@@ -55,20 +60,18 @@ export function deactivate(): Thenable<void> | undefined {
 
 async function startServer(context: ExtensionContext): Promise<void> {
   const config = workspace.getConfiguration("cinccino");
-  const rawServerPath = config.get<string>("serverPath") ?? "cinccino-lsp";
+  const rawServerPath = config.get<string>("serverPath") ?? DEFAULT_SERVER_PATH;
   const libraryPaths = config.get<string[]>("libraryPaths") ?? [];
 
   log?.appendLine(`config.serverPath = ${rawServerPath}`);
   log?.appendLine(`PATH             = ${process.env.PATH ?? "(unset)"}`);
   log?.appendLine(`libraryPaths     = ${JSON.stringify(libraryPaths)}`);
 
-  const ready = await ensureServerAvailable(rawServerPath);
-  if (!ready) {
+  const serverPath = await resolveServer(rawServerPath);
+  if (!serverPath) {
     log?.appendLine("server not available; skipping LSP start");
     return;
   }
-
-  const serverPath = resolveServerPath(rawServerPath);
   log?.appendLine(`resolved binary  = ${serverPath}`);
 
   const serverOptions: ServerOptions = {
@@ -127,53 +130,104 @@ async function stopServer(): Promise<void> {
 }
 
 /**
- * Confirm the binary referenced by `rawPath` is locatable. For absolute or
- * separator-bearing paths we stat the file directly; for bare names we ask
- * the shell via `which`. If missing, attempt cargo install silently (one
- * attempt per session) — matching the install-on-first-use UX of
- * rust-analyzer, gopls, etc.
+ * Resolve the LSP server binary path, walking a four-stop priority list.
+ * Returns the absolute path to spawn, or undefined if nothing usable was
+ * found (in which case startServer aborts gracefully).
  *
- * Two exceptions to the silent-install path:
- *   1. The user configured an *absolute* `cinccino.serverPath`. We respect
- *      their explicit choice and surface an error rather than installing
- *      somewhere they didn't ask for.
- *   2. The `cargo` binary itself is missing. We can't bootstrap a Rust
- *      toolchain without sudo / shell-rc edits, so we point at rustup.rs
- *      and leave the install to the user.
+ * Priority:
+ *   1. User-configured `cinccino.serverPath` if non-default. Respected
+ *      verbatim — we don't fall back if it's missing, since the user
+ *      explicitly pointed us somewhere.
+ *   2. Pre-built binary bundled into the .vsix at
+ *      `<extension>/server/<vscode-target>/cinccino-lsp[.exe]`. This is
+ *      the path Marketplace users on a platform-targeted .vsix take —
+ *      zero install steps for them.
+ *   3. `cinccino-lsp` already on PATH. Covers users who pre-installed
+ *      manually, plus the development-build .vsix that has no bundled
+ *      binary.
+ *   4. Auto-install via cargo. Last-resort for users on a generic .vsix
+ *      with no Rust toolchain prior, with bundled binary not present.
  */
-async function ensureServerAvailable(rawPath: string): Promise<boolean> {
-  if (await binaryResolves(rawPath)) return true;
-
-  if (path.isAbsolute(rawPath)) {
-    log?.appendLine(`absolute serverPath "${rawPath}" does not exist; not auto-installing`);
+async function resolveServer(rawPath: string): Promise<string | undefined> {
+  // (1) Explicit non-default override → respect it verbatim.
+  if (rawPath !== DEFAULT_SERVER_PATH) {
+    const expanded = expandUserPath(rawPath);
+    if (fs.existsSync(expanded)) return expanded;
+    log?.appendLine(`configured cinccino.serverPath "${rawPath}" does not exist`);
     window.showErrorMessage(
       `cinccino.serverPath points at "${rawPath}", which doesn't exist. ` +
-        `Either fix the setting or clear it to fall back to the default.`,
+        `Either fix the setting or clear it to fall back to the bundled binary.`,
     );
-    return false;
+    return undefined;
   }
 
+  // (2) Pre-built bundled binary.
+  const bundled = bundledServerPath();
+  if (bundled) {
+    log?.appendLine(`using bundled binary at ${bundled}`);
+    return bundled;
+  }
+
+  // (3) cinccino-lsp on PATH.
+  const onPath = await which(rawPath);
+  if (onPath) {
+    log?.appendLine(`found on PATH at ${onPath}`);
+    return onPath;
+  }
+
+  // (4) Auto-install via cargo, then re-check PATH.
   if (autoInstallAttempted) {
-    log?.appendLine("binary missing and auto-install already attempted this session");
-    return false;
+    log?.appendLine("auto-install already attempted this session; giving up");
+    return undefined;
   }
   autoInstallAttempted = true;
-
-  log?.appendLine("cinccino-lsp not found on PATH; attempting auto-install via cargo");
+  log?.appendLine("cinccino-lsp not found anywhere; attempting auto-install via cargo");
   const ok = await runCargoInstall();
-  return ok && (await binaryResolves(rawPath));
+  if (!ok) return undefined;
+  return (await which(rawPath)) ?? undefined;
 }
 
-async function binaryResolves(rawPath: string): Promise<boolean> {
-  if (path.isAbsolute(rawPath)) {
-    return fs.existsSync(rawPath);
+/**
+ * Map (process.platform, process.arch) to the VS Code target folder we
+ * publish under and check for a bundled binary there.
+ */
+function bundledServerPath(): string | undefined {
+  if (!extensionRoot) return undefined;
+  const target = vscodeTarget();
+  if (!target) {
+    log?.appendLine(`no bundled binary for ${process.platform}-${process.arch}`);
+    return undefined;
   }
-  if (rawPath.includes(path.sep) || rawPath.includes("/")) {
+  const exe = process.platform === "win32" ? "cinccino-lsp.exe" : "cinccino-lsp";
+  const candidate = path.join(extensionRoot, "server", target, exe);
+  return fs.existsSync(candidate) ? candidate : undefined;
+}
+
+function vscodeTarget(): string | undefined {
+  const arch = process.arch;
+  switch (process.platform) {
+    case "linux":
+      return arch === "arm64" ? "linux-arm64" : arch === "x64" ? "linux-x64" : undefined;
+    case "darwin":
+      return arch === "arm64" ? "darwin-arm64" : arch === "x64" ? "darwin-x64" : undefined;
+    case "win32":
+      return arch === "x64" ? "win32-x64" : undefined;
+    default:
+      return undefined;
+  }
+}
+
+function expandUserPath(raw: string): string {
+  // Expand a leading `~` for user-set absolute paths like ~/.cargo/bin/cinccino-lsp.
+  if (raw.startsWith("~")) return path.join(os.homedir(), raw.slice(1));
+  if (path.isAbsolute(raw)) return raw;
+  // Relative path with a separator → resolve against workspace root for
+  // backwards compatibility with the old behaviour.
+  if (raw.includes(path.sep) || raw.includes("/")) {
     const root = workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (!root) return false;
-    return fs.existsSync(path.resolve(root, rawPath));
+    return root ? path.resolve(root, raw) : raw;
   }
-  return (await which(rawPath)) !== null;
+  return raw;
 }
 
 /**
@@ -291,15 +345,3 @@ async function trySymlinkIntoLocalBin(): Promise<void> {
   }
 }
 
-function resolveServerPath(raw: string): string {
-  if (path.isAbsolute(raw)) {
-    return raw;
-  }
-  if (raw.includes(path.sep) || raw.includes("/")) {
-    const root = workspace.workspaceFolders?.[0]?.uri.fsPath;
-    if (root) {
-      return path.resolve(root, raw);
-    }
-  }
-  return raw;
-}
