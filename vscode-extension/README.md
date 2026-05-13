@@ -1,7 +1,7 @@
 # Cinccino — Circom Language Support for VS Code
 
 VS Code extension that wires the editor to the
-[cinccino](https://github.com/litwick/cinccino) LSP server, giving Circom
+[cinccino](https://github.com/mystiz-miso/cinccino) LSP server, giving Circom
 developers:
 
 - Syntax highlighting (TextMate grammar)
@@ -20,31 +20,38 @@ developers:
 Build cinccino from source and place `cinccino-lsp` on your `$PATH`:
 
 ```bash
-git clone https://github.com/litwick/cinccino.git
-cd cinccino
-cargo install --path . --bin cinccino-lsp
+cargo install --git https://github.com/mystiz-miso/cinccino.git --bin cinccino-lsp
 ```
+
+(Or clone and `cargo install --path .` if you'd prefer a checkout.)
 
 The binary lands in `~/.cargo/bin/cinccino-lsp`. Make sure that directory
 is on `$PATH`.
 
 ### 2. Install the extension
 
-While development builds the extension is not published to the VS Code
-Marketplace. Install it from source:
+From the VS Code Marketplace:
 
 ```bash
-cd cinccino/vscode-extension
-npm install
-npm run compile
-# Package into a .vsix
-npx @vscode/vsce package --out cinccino-circom.vsix
-# Install in VS Code
-code --install-extension cinccino-circom.vsix
+code --install-extension samueltangz.cinccino-circom
 ```
 
-Or, for iterative development, open the `vscode-extension/` folder in
-VS Code and press `F5` to launch an Extension Development Host.
+Or search for *Cinccino — Circom Language Support* in the Extensions
+view (`Cmd/Ctrl+Shift+X`).
+
+#### Building from source
+
+For iterative development, open the `vscode-extension/` folder in
+VS Code and press `F5` to launch an Extension Development Host. To
+build a `.vsix` manually:
+
+```bash
+cd vscode-extension
+npm install
+npm run compile
+npx @vscode/vsce package --no-dependencies --out cinccino-circom.vsix
+code --install-extension cinccino-circom.vsix
+```
 
 ## Configuration
 
@@ -68,5 +75,5 @@ Example `settings.json`:
 ## Contributing
 
 Bug reports and PRs welcome. The repo is at
-[github.com/litwick/cinccino](https://github.com/litwick/cinccino); the
-extension lives under `cinccino/vscode-extension/`.
+[github.com/mystiz-miso/cinccino](https://github.com/mystiz-miso/cinccino); the
+extension lives under `vscode-extension/`.

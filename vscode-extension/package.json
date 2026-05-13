@@ -2,20 +2,55 @@
   "name": "cinccino-circom",
   "displayName": "Cinccino — Circom Language Support",
   "description": "Circom language support powered by the cinccino LSP server.",
-  "version": "0.1.0",
-  "publisher": "cinccino",
+  "version": "0.1.4",
+  "publisher": "samueltangz",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mystiz-miso/cinccino.git",
+    "directory": "vscode-extension"
+  },
+  "bugs": {
+    "url": "https://github.com/mystiz-miso/cinccino/issues"
+  },
+  "homepage": "https://github.com/mystiz-miso/cinccino/tree/main/vscode-extension#readme",
+  "keywords": [
+    "circom",
+    "zk",
+    "zksnark",
+    "lsp",
+    "language-server"
+  ],
   "engines": {
     "vscode": "^1.85.0"
   },
-  "categories": ["Programming Languages", "Linters"],
-  "activationEvents": ["onLanguage:circom"],
+  "categories": [
+    "Programming Languages",
+    "Linters"
+  ],
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": true,
+      "description": "Reads Circom source via an LSP server; does not execute workspace code."
+    },
+    "virtualWorkspaces": false
+  },
+  "activationEvents": [
+    "onLanguage:circom",
+    "onStartupFinished"
+  ],
   "main": "./out/extension.js",
   "contributes": {
     "languages": [
       {
         "id": "circom",
-        "aliases": ["Circom", "circom"],
-        "extensions": [".circom"],
+        "aliases": [
+          "Circom",
+          "circom"
+        ],
+        "extensions": [
+          ".circom"
+        ],
         "configuration": "./language-configuration.json"
       }
     ],
@@ -24,6 +59,19 @@
         "language": "circom",
         "scopeName": "source.circom",
         "path": "./syntaxes/circom.tmLanguage.json"
+      }
+    ],
+    "snippets": [
+      {
+        "language": "circom",
+        "path": "./snippets/circom.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "cinccino.restart",
+        "title": "Cinccino: Restart Server",
+        "category": "Cinccino"
       }
     ],
     "configuration": {
@@ -37,13 +85,19 @@
         },
         "cinccino.trace.server": {
           "type": "string",
-          "enum": ["off", "messages", "verbose"],
+          "enum": [
+            "off",
+            "messages",
+            "verbose"
+          ],
           "default": "off",
           "description": "Traces the communication between VS Code and the cinccino server."
         },
         "cinccino.libraryPaths": {
           "type": "array",
-          "items": { "type": "string" },
+          "items": {
+            "type": "string"
+          },
           "default": [],
           "description": "Extra directories to search for `include` targets (e.g. circomlib)."
         }
@@ -51,9 +105,10 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "watch": "tsc -watch -p ./"
+    "vscode:prepublish": "npm run bundle",
+    "compile": "tsc -p ./ --noEmit && npm run bundle",
+    "bundle": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node20",
+    "watch": "esbuild ./src/extension.ts --bundle --outfile=out/extension.js --external:vscode --format=cjs --platform=node --target=node20 --watch"
   },
   "dependencies": {
     "vscode-languageclient": "^9.0.1"
@@ -61,6 +116,7 @@
   "devDependencies": {
     "@types/node": "^20.0.0",
     "@types/vscode": "^1.85.0",
+    "esbuild": "^0.28.0",
     "typescript": "^5.4.0"
   }
 }
