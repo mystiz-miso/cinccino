@@ -1,3 +1,6 @@
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::RwLock;
+
 use serde_json::Value;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::*;
@@ -12,6 +15,7 @@ use super::hover;
 use super::rename as rn;
 use super::signature_help as sig_help;
 use super::DocumentStore;
+use crate::ast::File;
 use crate::parser;
 use crate::span::{LineCol, LineIndex};
 use crate::symbol::DiagnosticKind;
@@ -21,6 +25,10 @@ use crate::symbol_table::SymbolTable;
 pub struct CinccinoBackend {
     client: Client,
     documents: DocumentStore,
+    /// Library directories searched after the including file's own
+    /// directory when resolving `include "..."`. Populated from the
+    /// `libraryPaths` initialization option.
+    library_paths: RwLock<Vec<String>>,
 }
 
 impl CinccinoBackend {
@@ -28,7 +36,128 @@ impl CinccinoBackend {
         Self {
             client,
             documents: DocumentStore::new(),
+            library_paths: RwLock::new(Vec::new()),
         }
+    }
+
+    fn lib_dirs(&self) -> Vec<String> {
+        self.library_paths.read().unwrap().clone()
+    }
+
+    /// Best-effort conversion from an LSP URI string to a filesystem path
+    /// suitable for include resolution. URIs like `file:///foo/bar.circom`
+    /// become `/foo/bar.circom`; everything else is returned unchanged so
+    /// the existing tests (which pass bare paths) keep working.
+    fn uri_to_fs_path(uri: &str) -> String {
+        if let Ok(url) = Url::parse(uri) {
+            if let Ok(p) = url.to_file_path() {
+                return p.to_string_lossy().into_owned();
+            }
+        }
+        uri.to_string()
+    }
+
+    /// After the root file is indexed, walk its `include` graph
+    /// transitively. Each included file's text comes from the matching
+    /// open buffer if VS Code has one (so unsaved edits win), otherwise
+    /// from disk.
+    ///
+    /// Indexing key is the resolved `file://` URI of the file on disk —
+    /// the same string that goto-definition needs to return as a
+    /// `Location`. Each file's `includes` list is rewritten to point at
+    /// those URIs (rather than the raw strings from the AST) so the BFS
+    /// in `lookup_with_includes` connects correctly.
+    fn populate_transitive_includes(
+        &self,
+        table: &mut SymbolTable,
+        root_uri: &str,
+        open_docs: &HashMap<String, String>,
+    ) {
+        let lib_dirs = self.lib_dirs();
+        let root_fs = Self::uri_to_fs_path(root_uri);
+
+        // Rewrite the root file's raw include strings to resolved URIs
+        // (falling back to the raw string if unresolved so length stays
+        // aligned with what's in the AST).
+        let rewritten_root = Self::resolve_includes_for(table, root_uri, &root_fs, &lib_dirs);
+        table.replace_includes(root_uri, rewritten_root.clone());
+
+        // BFS over resolved-URI keys. visited prevents revisits both in
+        // the cyclic-include case and when two parents include the same
+        // file.
+        let mut visited: HashSet<String> = HashSet::new();
+        visited.insert(root_uri.to_string());
+
+        let mut queue: VecDeque<String> = VecDeque::new();
+        for u in rewritten_root {
+            if visited.insert(u.clone()) {
+                queue.push_back(u);
+            }
+        }
+
+        while let Some(target_uri) = queue.pop_front() {
+            let target_fs = Self::uri_to_fs_path(&target_uri);
+
+            // Prefer the open buffer over the file on disk so unsaved
+            // edits in another tab are reflected in diagnostics.
+            let text = open_docs
+                .get(&target_uri)
+                .cloned()
+                .or_else(|| std::fs::read_to_string(&target_fs).ok());
+            let Some(text) = text else { continue };
+
+            let (ast, _) = parser::parse(&text);
+            table.index_file(&target_uri, &ast);
+
+            let rewritten =
+                Self::resolve_includes_for(table, &target_uri, &target_fs, &lib_dirs);
+            table.replace_includes(&target_uri, rewritten.clone());
+
+            for u in rewritten {
+                if visited.insert(u.clone()) {
+                    queue.push_back(u);
+                }
+            }
+        }
+    }
+
+    /// Map the freshly-indexed file's raw include strings to resolved
+    /// `file://` URIs. Unresolvable includes (e.g. `circomlib/...` with
+    /// no matching `libraryPaths` entry) keep their raw string so they
+    /// surface as undeclared-symbol diagnostics rather than silently
+    /// disappearing.
+    fn resolve_includes_for(
+        table: &SymbolTable,
+        file_key: &str,
+        file_fs: &str,
+        lib_dirs: &[String],
+    ) -> Vec<String> {
+        let raw = table.includes(file_key).map(|s| s.to_vec()).unwrap_or_default();
+        raw.into_iter()
+            .map(|inc| match table.resolve_include_path(&inc, file_fs, lib_dirs) {
+                Some(p) => Url::from_file_path(&p).map(|u| u.to_string()).unwrap_or(inc),
+                None => inc,
+            })
+            .collect()
+    }
+
+    /// Text for a target file: open buffer first, then disk. Used by
+    /// navigation handlers to translate byte spans into line/column for
+    /// files that aren't open in the editor.
+    fn target_text_for_uri(&self, target_uri: &Url) -> Option<String> {
+        if let Some(t) = self.documents.get_text(target_uri) {
+            return Some(t);
+        }
+        let path = target_uri.to_file_path().ok()?;
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn open_docs_map(&self) -> HashMap<String, String> {
+        self.documents
+            .all_documents()
+            .into_iter()
+            .map(|(u, t)| (u.to_string(), t))
+            .collect()
     }
 
     /// Resolve `(text, byte_offset, word)` for the identifier at `position`
@@ -47,24 +176,23 @@ impl CinccinoBackend {
         Some((text, offset, word))
     }
 
-    /// Index the current document and every other open document into a
-    /// fresh `SymbolTable`, returning the parsed AST of the current file.
-    fn build_cross_document_table(&self, uri: &Url, text: &str) -> (crate::ast::File, SymbolTable) {
+    /// Index the current document plus its transitive include closure
+    /// (read from disk; open buffers shadow disk content). Returns the
+    /// parsed AST of the current file.
+    fn build_cross_document_table(&self, uri: &Url, text: &str) -> (File, SymbolTable) {
         let (ast, _) = parser::parse(text);
         let file_path = uri.as_str();
         let mut symbol_table = SymbolTable::new();
         symbol_table.index_file(file_path, &ast);
 
-        for (doc_uri, doc_text) in self.documents.all_documents() {
-            if doc_uri != *uri {
-                let (doc_ast, _) = parser::parse(&doc_text);
-                symbol_table.index_file(doc_uri.as_str(), &doc_ast);
-            }
-        }
+        let open_docs = self.open_docs_map();
+        self.populate_transitive_includes(&mut symbol_table, file_path, &open_docs);
         (ast, symbol_table)
     }
 
-    /// Run semantic checks across all open documents and collect LSP diagnostics.
+    /// Run semantic checks against the current file plus its transitive
+    /// include closure, and collect LSP diagnostics for the current file
+    /// only.
     fn collect_semantic_diagnostics(
         &self,
         uri: &Url,
@@ -76,13 +204,8 @@ impl CinccinoBackend {
         let mut table = SymbolTable::new();
         table.index_file(file_path, &ast);
 
-        // Also index other open documents for cross-file resolution.
-        for (doc_uri, doc_text) in self.documents.all_documents() {
-            if doc_uri != *uri {
-                let (doc_ast, _) = parser::parse(&doc_text);
-                table.index_file(doc_uri.as_str(), &doc_ast);
-            }
-        }
+        let open_docs = self.open_docs_map();
+        self.populate_transitive_includes(&mut table, file_path, &open_docs);
 
         // Run type checker and constraint checker.
         table.check_types(file_path, &ast);
@@ -174,7 +297,19 @@ fn severity_for(kind: DiagnosticKind) -> DiagnosticSeverity {
 
 #[tower_lsp::async_trait]
 impl LanguageServer for CinccinoBackend {
-    async fn initialize(&self, _: InitializeParams) -> Result<InitializeResult> {
+    async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
+        // Pull libraryPaths out of {"libraryPaths": ["..."]} initialization
+        // options. The extension client sends these from the
+        // `cinccino.libraryPaths` user setting.
+        if let Some(opts) = &params.initialization_options {
+            if let Some(arr) = opts.get("libraryPaths").and_then(|v| v.as_array()) {
+                let dirs: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect();
+                *self.library_paths.write().unwrap() = dirs;
+            }
+        }
         Ok(InitializeResult {
             capabilities: server_capabilities(),
             server_info: Some(ServerInfo {
@@ -353,12 +488,15 @@ impl LanguageServer for CinccinoBackend {
         if let Some(symbol) = symbol_table.lookup_with_includes(scope, &word, file_path) {
             let target_uri = Url::parse(&symbol.file).unwrap_or_else(|_| uri.clone());
 
-            // For cross-file symbols we need the target file's text
+            // For cross-file symbols we need the target file's text so
+            // we can convert byte spans to line/col. Open buffer first,
+            // then disk; only fall through to the current file's text
+            // when symbol came from the current file or no disk source
+            // exists (shouldn't happen post-fix, but keep safe).
             let target_text = if symbol.file == file_path {
                 text.clone()
             } else {
-                self.documents
-                    .get_text(&target_uri)
+                self.target_text_for_uri(&target_uri)
                     .unwrap_or_else(|| text.clone())
             };
             let target_line_index = LineIndex::new(&target_text);
@@ -375,6 +513,19 @@ impl LanguageServer for CinccinoBackend {
         }
 
         Ok(None)
+    }
+
+    /// Circom has no interface/trait/abstract construct — every template
+    /// and function has exactly one definition site. "Go to Implementation"
+    /// (Ctrl+F12 in VS Code) is therefore identical to "Go to Definition";
+    /// we delegate so the two stay in sync. (`GotoImplementationParams` /
+    /// `Response` are type aliases for the `GotoDefinition*` types in
+    /// `lsp_types::request`, so the signatures are interchangeable.)
+    async fn goto_implementation(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        self.goto_definition(params).await
     }
 
     #[tracing::instrument(
@@ -722,35 +873,35 @@ fn scan_identifier_occurrences(
     include_declaration: bool,
     locations: &mut Vec<Location>,
 ) {
+    // Walk the lexer's token stream instead of doing a raw text find.
+    // The lexer already skips comments (`//` and `/* */`) and exposes
+    // string literals as a distinct token, so identifier-shaped text
+    // inside comments or strings is never reported as a reference —
+    // which was the bug here: doc comments like `/** GTBitVector: … */`
+    // were counted as usages of the template.
     let line_index = LineIndex::new(doc_text);
-    let bytes = doc_text.as_bytes();
-    let name_len = name.len();
-
-    let mut pos = 0;
-    while pos + name_len <= bytes.len() {
-        let Some(found) = doc_text[pos..].find(name) else {
-            break;
+    let (tokens, _errors) = crate::lexer::tokenize(doc_text);
+    for spanned in tokens {
+        let crate::lexer::Token::Ident(ref ident) = spanned.token else {
+            continue;
         };
-        let abs_pos = pos + found;
-        let before_ok = abs_pos == 0 || !is_ident_byte(bytes[abs_pos - 1]);
-        let after_ok =
-            abs_pos + name_len >= bytes.len() || !is_ident_byte(bytes[abs_pos + name_len]);
-
-        if before_ok && after_ok {
-            let is_definition = doc_uri.as_str() == def_file && abs_pos == def_start;
-            if include_declaration || !is_definition {
-                if let (Some(start), Some(end)) = (
-                    line_index.line_col(abs_pos),
-                    line_index.line_col(abs_pos + name_len),
-                ) {
-                    locations.push(Location {
-                        uri: doc_uri.clone(),
-                        range: lc_range(start, end),
-                    });
-                }
-            }
+        if ident != name {
+            continue;
         }
-        pos = abs_pos + name_len;
+        let is_definition = doc_uri.as_str() == def_file && spanned.span.start == def_start;
+        if !include_declaration && is_definition {
+            continue;
+        }
+        let (Some(start), Some(end)) = (
+            line_index.line_col(spanned.span.start),
+            line_index.line_col(spanned.span.end),
+        ) else {
+            continue;
+        };
+        locations.push(Location {
+            uri: doc_uri.clone(),
+            range: lc_range(start, end),
+        });
     }
 }
 
@@ -773,6 +924,7 @@ fn server_capabilities() -> ServerCapabilities {
             ..Default::default()
         }),
         definition_provider: Some(OneOf::Left(true)),
+        implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
         hover_provider: Some(HoverProviderCapability::Simple(true)),
         references_provider: Some(OneOf::Left(true)),
         document_symbol_provider: Some(OneOf::Left(true)),
@@ -835,11 +987,6 @@ fn position_to_byte_offset(source: &str, position: Position) -> Option<usize> {
     }
     // Line past end of source.
     Some(source.len())
-}
-
-/// Check if a byte is a valid identifier character.
-fn is_ident_byte(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 /// Extract the word (identifier) at a given byte offset in source text.
