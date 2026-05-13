@@ -156,12 +156,15 @@ build_one() {
 }
 
 # Package + publish one vsix. If $1 is empty, produces an untargeted vsix.
+# Note: vsce publish refuses --target alongside --packagePath (the .vsix
+# already encodes the target in its manifest). So --target only goes to
+# the package step.
 package_publish() {
   local target="${1:-}"
-  local args=()
+  local pkg_args=()
   local vsix
   if [[ -n "$target" ]]; then
-    args=(--target "$target")
+    pkg_args=(--target "$target")
     vsix="cinccino-circom-${target}.vsix"
   else
     vsix="cinccino-circom-generic.vsix"
@@ -169,14 +172,14 @@ package_publish() {
   rm -f "$vsix"
 
   echo "→ packaging ${vsix}"
-  npx --yes @vscode/vsce package --no-dependencies "${args[@]}" --out "$vsix"
+  npx --yes @vscode/vsce package --no-dependencies "${pkg_args[@]}" --out "$vsix"
 
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "  dry-run: $EXT_DIR/$vsix"
     return
   fi
   echo "→ publishing $vsix"
-  npx --yes @vscode/vsce publish --no-dependencies "${args[@]}" --packagePath "$vsix"
+  npx --yes @vscode/vsce publish --no-dependencies --packagePath "$vsix"
   echo "  ✓ published"
 }
 
