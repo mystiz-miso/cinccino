@@ -22,6 +22,15 @@ import {
 const SERVER_REPO = "https://github.com/mystiz-miso/cinccino.git";
 const DEFAULT_SERVER_PATH = "cinccino-lsp";
 
+// Minimum cinccino-lsp version this extension requires. Bump this in
+// lockstep with `cinccino/Cargo.toml` whenever the extension starts
+// depending on a server-side fix or feature — the activation-time version
+// check below will then prompt users on older binaries to upgrade.
+const MIN_SERVER_VERSION = "0.2.0";
+
+type ServerSource = "override" | "bundled" | "path" | "cargo";
+type ResolvedServer = { path: string; source: ServerSource };
+
 let client: LanguageClient | undefined;
 let log: OutputChannel | undefined;
 let extensionRoot: string | undefined;
@@ -67,21 +76,21 @@ async function startServer(context: ExtensionContext): Promise<void> {
   log?.appendLine(`PATH             = ${process.env.PATH ?? "(unset)"}`);
   log?.appendLine(`libraryPaths     = ${JSON.stringify(libraryPaths)}`);
 
-  const serverPath = await resolveServer(rawServerPath);
-  if (!serverPath) {
+  const resolved = await resolveServer(rawServerPath);
+  if (!resolved) {
     log?.appendLine("server not available; skipping LSP start");
     return;
   }
-  log?.appendLine(`resolved binary  = ${serverPath}`);
+  log?.appendLine(`resolved binary  = ${resolved.path} (source: ${resolved.source})`);
 
   const serverOptions: ServerOptions = {
     run: {
-      command: serverPath,
+      command: resolved.path,
       transport: TransportKind.stdio,
       options: { env: process.env },
     },
     debug: {
-      command: serverPath,
+      command: resolved.path,
       transport: TransportKind.stdio,
       options: { env: { ...process.env, RUST_LOG: "cinccino=debug" } },
     },
@@ -110,13 +119,75 @@ async function startServer(context: ExtensionContext): Promise<void> {
   try {
     await client.start();
     log?.appendLine(`[${new Date().toISOString()}] LSP started successfully`);
+    await checkServerVersion(resolved, context);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     log?.appendLine(`ERROR starting LSP: ${msg}`);
-    window.showErrorMessage(`Failed to start cinccino-lsp at ${serverPath}: ${msg}`);
+    window.showErrorMessage(`Failed to start cinccino-lsp at ${resolved.path}: ${msg}`);
   }
 
   context.subscriptions.push({ dispose: () => void client?.stop() });
+}
+
+/**
+ * Compare two `MAJOR.MINOR.PATCH` strings. Returns negative if `a < b`,
+ * 0 if equal, positive if `a > b`. Non-numeric or pre-release suffixes
+ * are ignored — sufficient for our gating use case.
+ */
+function compareSemver(a: string, b: string): number {
+  const parse = (s: string) =>
+    s.split(".").slice(0, 3).map((p) => parseInt(p, 10) || 0);
+  const [a0, a1, a2] = parse(a);
+  const [b0, b1, b2] = parse(b);
+  return a0 - b0 || a1 - b1 || a2 - b2;
+}
+
+/**
+ * If the running cinccino-lsp predates `MIN_SERVER_VERSION`, react based
+ * on where the binary came from:
+ *   - cargo / path: offer to run cargo install (we manage that path).
+ *   - bundled:       warn and suggest reinstalling the extension.
+ *   - override:      warn only — the user pinned this binary themselves.
+ */
+async function checkServerVersion(
+  resolved: ResolvedServer,
+  context: ExtensionContext,
+): Promise<void> {
+  const reported = client?.initializeResult?.serverInfo?.version;
+  if (!reported) {
+    log?.appendLine("server did not report a version; skipping version check");
+    return;
+  }
+  log?.appendLine(`server reports version ${reported}; required >= ${MIN_SERVER_VERSION}`);
+  if (compareSemver(reported, MIN_SERVER_VERSION) >= 0) return;
+
+  const summary = `cinccino-lsp ${reported} is older than the ${MIN_SERVER_VERSION} this extension requires.`;
+  log?.appendLine(summary);
+
+  if (resolved.source === "override") {
+    window.showWarningMessage(
+      `${summary} You set cinccino.serverPath manually, so update or replace that binary yourself.`,
+    );
+    return;
+  }
+  if (resolved.source === "bundled") {
+    window.showWarningMessage(
+      `${summary} Reinstall the extension to pick up the bundled binary that matches.`,
+    );
+    return;
+  }
+
+  const choice = await window.showWarningMessage(
+    `${summary} Upgrade now via cargo install?`,
+    "Upgrade",
+    "Later",
+  );
+  if (choice !== "Upgrade") return;
+
+  const ok = await runCargoInstall();
+  if (!ok) return;
+  await stopServer();
+  await startServer(context);
 }
 
 async function stopServer(): Promise<void> {
@@ -148,11 +219,11 @@ async function stopServer(): Promise<void> {
  *   4. Auto-install via cargo. Last-resort for users on a generic .vsix
  *      with no Rust toolchain prior, with bundled binary not present.
  */
-async function resolveServer(rawPath: string): Promise<string | undefined> {
+async function resolveServer(rawPath: string): Promise<ResolvedServer | undefined> {
   // (1) Explicit non-default override → respect it verbatim.
   if (rawPath !== DEFAULT_SERVER_PATH) {
     const expanded = expandUserPath(rawPath);
-    if (fs.existsSync(expanded)) return expanded;
+    if (fs.existsSync(expanded)) return { path: expanded, source: "override" };
     log?.appendLine(`configured cinccino.serverPath "${rawPath}" does not exist`);
     window.showErrorMessage(
       `cinccino.serverPath points at "${rawPath}", which doesn't exist. ` +
@@ -165,14 +236,14 @@ async function resolveServer(rawPath: string): Promise<string | undefined> {
   const bundled = bundledServerPath();
   if (bundled) {
     log?.appendLine(`using bundled binary at ${bundled}`);
-    return bundled;
+    return { path: bundled, source: "bundled" };
   }
 
   // (3) cinccino-lsp on PATH.
   const onPath = await which(rawPath);
   if (onPath) {
     log?.appendLine(`found on PATH at ${onPath}`);
-    return onPath;
+    return { path: onPath, source: "path" };
   }
 
   // (4) Auto-install via cargo, then re-check PATH.
@@ -184,7 +255,8 @@ async function resolveServer(rawPath: string): Promise<string | undefined> {
   log?.appendLine("cinccino-lsp not found anywhere; attempting auto-install via cargo");
   const ok = await runCargoInstall();
   if (!ok) return undefined;
-  return (await which(rawPath)) ?? undefined;
+  const installed = await which(rawPath);
+  return installed ? { path: installed, source: "cargo" } : undefined;
 }
 
 /**

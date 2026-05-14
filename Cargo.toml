@@ -1,6 +1,6 @@
 [package]
 name = "cinccino"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Circom LSP server"
 
@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 criterion = { version = "0.5", features = ["html_reports"] }
 insta = "1"
 pretty_assertions = "1"
+tempfile = "3"
 
 [[bench]]
 name = "parse_bench"
