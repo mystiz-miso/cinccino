@@ -267,17 +267,27 @@ impl<'a> TypeChecker<'a> {
         components: &HashMap<String, ComponentInfo>,
         out: &mut ComponentAccess,
     ) {
-        self.collect_accesses_in_expr(&a.rhs, components, out, /*is_write*/ false);
         match a.op {
+            // `lhs <== rhs` / `lhs <-- rhs` — write LHS, read RHS.
             AssignOp::SafeLeft | AssignOp::UnsafeLeft => {
+                self.collect_accesses_in_expr(&a.rhs, components, out, false);
                 self.record_if_component_access(&a.lhs, components, out, true);
                 self.collect_accesses_in_expr(&a.lhs, components, out, false);
             }
+            // `lhs ==> rhs` / `lhs --> rhs` — read LHS, write RHS. The
+            // mirror image of the SafeLeft arm; previously the walker
+            // only marked RHS as a write and never traversed LHS, so
+            // reads via `comp.out ==> sig` were invisible to the
+            // unused-output check.
             AssignOp::SafeRight | AssignOp::UnsafeRight => {
+                self.collect_accesses_in_expr(&a.lhs, components, out, false);
                 self.record_if_component_access(&a.rhs, components, out, true);
+                self.collect_accesses_in_expr(&a.rhs, components, out, false);
             }
+            // `lhs === rhs` — both sides are constrained, treat as reads.
             AssignOp::Eq => {
                 self.collect_accesses_in_expr(&a.lhs, components, out, false);
+                self.collect_accesses_in_expr(&a.rhs, components, out, false);
             }
         }
     }

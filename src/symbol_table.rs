@@ -223,6 +223,15 @@ impl SymbolTable {
         Some(current)
     }
 
+    /// Replace the recorded includes list for a file. Useful when the
+    /// caller has resolved each raw include string from the AST to a
+    /// stable key (e.g. an absolute `file://` URI) — the BFS in
+    /// `lookup_with_includes` walks via these strings, so they must
+    /// match the keys under which the included files were indexed.
+    pub fn replace_includes(&mut self, file_path: &str, includes: Vec<String>) {
+        self.includes.insert(file_path.to_string(), includes);
+    }
+
     /// Resolve an include path relative to the including file's directory.
     /// Also searches library directories if configured.
     pub fn resolve_include_path(

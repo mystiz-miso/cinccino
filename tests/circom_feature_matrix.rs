@@ -70,6 +70,17 @@ fn expect_kind(src: &str, kind: DiagnosticKind) {
     );
 }
 
+/// Assert that no diagnostic of the given kind is produced. Used to
+/// guard against false-positive warnings.
+fn expect_no_kind(src: &str, kind: DiagnosticKind) {
+    let diags = analyze(src);
+    let matched: Vec<&SymbolDiagnostic> = diags.iter().filter(|d| d.kind == kind).collect();
+    assert!(
+        matched.is_empty(),
+        "expected zero {kind:?} diagnostics, got: {matched:?}"
+    );
+}
+
 // ─── pragmas ───────────────────────────────────────────────────────────
 
 #[test]
@@ -502,6 +513,31 @@ fn signal_assign_safe_right() {
         pragma circom 2.0.0;
         template T() { signal input a; signal output b; a ==> b; }
         "#,
+    );
+}
+
+#[test]
+fn component_output_read_via_safe_right() {
+    // Regression: `comp.out ==> sig` is a *read* of `comp.out`, so the
+    // unused-output checker must not flag `out` as never read. Mirrors
+    // the pattern from circomlib's mux1.circom.
+    expect_no_kind(
+        r#"
+        pragma circom 2.0.0;
+        template Inner() {
+            signal input x;
+            signal output y;
+            y <== x;
+        }
+        template Outer() {
+            signal input s;
+            signal output o;
+            component inner = Inner();
+            s ==> inner.x;
+            inner.y ==> o;
+        }
+        "#,
+        DiagnosticKind::UnusedComponentOutput,
     );
 }
 

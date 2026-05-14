@@ -72,9 +72,14 @@ fn compute_incidence(
     for c in constraints {
         for sig in &c.signals {
             mentioned_by_some_constraint.insert(sig.clone());
-        }
-        if let Some(lhs) = &c.driven {
-            if let Some(driven) = output_is_driven.get_mut(lhs) {
+            // An output is "driven" if it appears in any constraint —
+            // not only as a bare LHS/RHS. This is the common circomlib
+            // pattern: `out <-- expr;` paired with a separate `===`
+            // that pins `out`, where `out` is buried inside a product
+            // expression (e.g. `out * x === y`). The previous bare-ref
+            // rule missed this and produced false-positive
+            // "never assigned" warnings.
+            if let Some(driven) = output_is_driven.get_mut(sig) {
                 *driven = true;
             }
         }
@@ -211,12 +216,12 @@ fn collect_signals_in_scope(
 }
 
 /// A constraint / assignment that contributes to the R1CS system.
+/// We track the set of signal names mentioned anywhere in it; an output
+/// is considered "driven" if it appears in *any* such constraint (the
+/// `<-- pin + === constraint` idiom relies on this — see
+/// `compute_incidence`).
 struct Constraint {
-    /// Signal names mentioned anywhere in the constraint.
     signals: HashSet<String>,
-    /// If this constraint "drives" a single signal (LHS of `<==` or `===`
-    /// where one side is a bare signal reference), that signal's name.
-    driven: Option<String>,
 }
 
 fn collect_constraints_in_block(
@@ -233,45 +238,22 @@ fn constraint_from_eq(c: &ConstraintEqStmt, signals: &HashMap<String, SignalInfo
     let mut sigs = HashSet::new();
     collect_signal_refs(&c.lhs, signals, &mut sigs);
     collect_signal_refs(&c.rhs, signals, &mut sigs);
-    // A `===` constraint drives either side if that side is a
-    // bare signal ref; we accept either.
-    let driven = c
-        .lhs
-        .extract_base_name()
-        .filter(|n| signals.contains_key(n))
-        .or_else(|| {
-            c.rhs
-                .extract_base_name()
-                .filter(|n| signals.contains_key(n))
-        });
-    Constraint {
-        signals: sigs,
-        driven,
-    }
+    Constraint { signals: sigs }
 }
 
 fn constraint_from_assignment(
     a: &AssignStmt,
     signals: &HashMap<String, SignalInfo>,
 ) -> Option<Constraint> {
-    let (driven_side, driven_op) = match a.op {
-        AssignOp::SafeLeft => (&a.lhs, true),
-        AssignOp::SafeRight => (&a.rhs, true),
-        AssignOp::UnsafeLeft | AssignOp::UnsafeRight | AssignOp::Eq => return None,
-    };
-    if !driven_op {
+    // Only `<==` / `==>` add an R1CS row; `<--` / `-->` are witness-
+    // only and `===` is handled by `constraint_from_eq`.
+    if !matches!(a.op, AssignOp::SafeLeft | AssignOp::SafeRight) {
         return None;
     }
     let mut sigs = HashSet::new();
     collect_signal_refs(&a.lhs, signals, &mut sigs);
     collect_signal_refs(&a.rhs, signals, &mut sigs);
-    let driven = driven_side
-        .extract_base_name()
-        .filter(|n| signals.contains_key(n));
-    Some(Constraint {
-        signals: sigs,
-        driven,
-    })
+    Some(Constraint { signals: sigs })
 }
 
 fn constraints_from_tuple_assign(
@@ -286,13 +268,7 @@ fn constraints_from_tuple_assign(
         let mut sigs = HashSet::new();
         collect_signal_refs(target, signals, &mut sigs);
         collect_signal_refs(&t.rhs, signals, &mut sigs);
-        let driven = target
-            .extract_base_name()
-            .filter(|n| signals.contains_key(n));
-        out.push(Constraint {
-            signals: sigs,
-            driven,
-        });
+        out.push(Constraint { signals: sigs });
     }
 }
 
@@ -308,10 +284,7 @@ fn constraints_from_signal_decl(
                 let mut sigs = HashSet::new();
                 sigs.insert(entry.name.name.clone());
                 collect_signal_refs(init, signals, &mut sigs);
-                out.push(Constraint {
-                    signals: sigs,
-                    driven: Some(entry.name.name.clone()),
-                });
+                out.push(Constraint { signals: sigs });
             }
         }
     }
@@ -446,6 +419,37 @@ mod tests {
             "#,
         );
         assert!(diags.is_empty(), "expected no diagnostics, got: {diags:?}");
+    }
+
+    #[test]
+    fn no_warning_for_unsafe_assign_paired_with_constraint() {
+        // Regression: Montgomery2Edwards pattern — `out <-- expr;` plus
+        // a separate `===` where the output is buried inside a product.
+        // Pre-fix, `extract_base_name` returned `None` for the LHS of
+        // `out * in1 === in2` so the output was treated as undriven.
+        let diags = analyze_src(
+            r#"
+            template Montgomery2EdwardsLike() {
+                signal input in1;
+                signal input in2;
+                signal output out;
+                out <-- in2 / in1;
+                out * in1 === in2;
+            }
+            "#,
+        );
+        let undriven: Vec<&SymbolDiagnostic> = diags
+            .iter()
+            .filter(|d| {
+                d.kind == DiagnosticKind::UnderconstrainedOutput
+                    && d.message.contains("'out'")
+                    && d.message.contains("never assigned")
+            })
+            .collect();
+        assert!(
+            undriven.is_empty(),
+            "out is constrained by `out * in1 === in2`; should not warn: {undriven:?}"
+        );
     }
 
     #[test]

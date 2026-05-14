@@ -1362,6 +1362,36 @@ async fn goto_definition_unknown_symbol_returns_null() {
     client.shutdown_and_exit().await;
 }
 
+#[tokio::test]
+async fn goto_implementation_template() {
+    // Circom has no interface/trait construct, so goto_implementation
+    // resolves to the same site as goto_definition. This test guards
+    // the delegation in backend.rs.
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/goto_impl.circom";
+    let text = "template Adder(n) {\n    signal input a;\n    signal output b;\n    b <== a;\n}\ntemplate Main() {\n    component c = Adder(4);\n}\n";
+    client.open_doc(uri, text).await;
+
+    let resp = client
+        .request(
+            "textDocument/implementation",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 6, "character": 20 }
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected implementation location");
+    assert_eq!(result["uri"], uri);
+    assert_eq!(result["range"]["start"]["line"], 0);
+
+    client.shutdown_and_exit().await;
+}
+
 // ───────────────────── find references ─────────────────────
 
 #[tokio::test]
@@ -1391,6 +1421,72 @@ async fn references_finds_all_usages() {
         result.len() >= 2,
         "expected at least 2 references for 'a': {result:?}"
     );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn references_skip_doc_comments_and_strings() {
+    // Regression: the find-references scanner used to do a raw text
+    // search and would surface identifier matches inside `/** ... */`
+    // doc comments and string literals. We mirror the actual case
+    // from zklogin's misc.circom where `GTBitVector` is mentioned in
+    // the doc block immediately above its template declaration.
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    let uri = "file:///test/refs_doc.circom";
+    let text = "/**\n\
+                GTBitVector: returns a bit vector\n\
+                **/\n\
+                template GTBitVector(n) {\n\
+                    signal output out;\n\
+                    out <== 1;\n\
+                }\n\
+                template Caller() {\n\
+                    component c = GTBitVector(8);  // also note: GTBitVector usage\n\
+                    component d = GTBitVector(4);\n\
+                }\n";
+    client.open_doc(uri, text).await;
+
+    // Cursor on the template declaration (line 3, col 13 — inside "GTBitVector").
+    let resp = client
+        .request(
+            "textDocument/references",
+            Some(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 3, "character": 13 },
+                "context": { "includeDeclaration": true }
+            })),
+        )
+        .await;
+
+    let result = resp["result"].as_array().expect("expected array");
+    // Expect exactly three hits: the declaration on line 3 plus the
+    // two `GTBitVector(...)` call sites. The mention inside the `/**
+    // **/` doc block on line 1 and the `// also note: GTBitVector
+    // usage` line-comment on line 8 must NOT be reported.
+    assert_eq!(
+        result.len(),
+        3,
+        "expected exactly 3 references (decl + 2 usages, no comment hits): {result:?}"
+    );
+    let comment_lines = [0usize, 1, 2]; // the /** ... **/ block
+    for loc in result {
+        let line = loc["range"]["start"]["line"].as_u64().unwrap() as usize;
+        assert!(
+            !comment_lines.contains(&line),
+            "reference at line {line} falls inside the doc comment: {loc:?}"
+        );
+        // The line-comment trailing-text on line 8 also must not count.
+        if line == 8 {
+            let col = loc["range"]["start"]["character"].as_u64().unwrap();
+            assert!(
+                col < 25,
+                "reference on line 8 looks like it's inside the trailing line-comment: col={col}"
+            );
+        }
+    }
 
     client.shutdown_and_exit().await;
 }
@@ -1497,6 +1593,20 @@ async fn initialize_advertises_definition_provider() {
     assert_eq!(
         result["capabilities"]["definitionProvider"], true,
         "should advertise definition"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn initialize_advertises_implementation_provider() {
+    let mut client = InProcessClient::spawn();
+    let resp = client.initialize().await;
+
+    let result = &resp["result"];
+    assert_eq!(
+        result["capabilities"]["implementationProvider"], true,
+        "should advertise implementation"
     );
 
     client.shutdown_and_exit().await;
@@ -1792,6 +1902,260 @@ async fn code_action_empty_for_no_matching_diagnostics() {
     assert!(
         result.is_null(),
         "expected null for no diagnostics, got: {result}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+// ────────────── transitive include resolution from disk ──────────────
+//
+// These tests verify that the LSP indexes files referenced via `include`
+// directives even when those files are not opened in the editor. The
+// fixtures live in a fresh tempdir per test so they're hermetic.
+
+async fn drain_diagnostics_for(client: &mut InProcessClient, uri: &str) -> Vec<Value> {
+    let msg = timeout(Duration::from_secs(5), async {
+        loop {
+            let m = client.read_message().await;
+            if m.get("method") == Some(&json!("textDocument/publishDiagnostics"))
+                && m["params"]["uri"].as_str() == Some(uri)
+            {
+                return m;
+            }
+        }
+    })
+    .await
+    .expect("timed out waiting for diagnostics");
+    msg["params"]["diagnostics"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn includes_resolve_template_from_disk_without_opening() {
+    // pedersen-style: root file includes a sibling that defines the
+    // template; we never open the sibling. Pre-fix this would have
+    // produced an "undeclared symbol" diagnostic.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib_path = tmp.path().join("lib.circom");
+    std::fs::write(
+        &lib_path,
+        "pragma circom 2.0.0;\ntemplate Lib() { signal input x; signal output y; y <== x; }\n",
+    )
+    .unwrap();
+
+    let root_path = tmp.path().join("root.circom");
+    let root_src = "pragma circom 2.0.0;\n\
+                    include \"lib.circom\";\n\
+                    template Root() {\n\
+                        signal output o;\n\
+                        component c = Lib();\n\
+                        c.x <== 1;\n\
+                        o <== c.y;\n\
+                    }\n";
+    std::fs::write(&root_path, root_src).unwrap();
+    let root_uri = format!("file://{}", root_path.display());
+
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client.open_doc(&root_uri, root_src).await;
+
+    let diags = drain_diagnostics_for(&mut client, &root_uri).await;
+    let undeclared: Vec<&Value> = diags
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("undeclared"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "expected 0 undeclared-symbol diagnostics, got: {undeclared:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn open_buffer_shadows_on_disk_include() {
+    // The open buffer's text — including unsaved edits — must take
+    // precedence over the on-disk version of the same file.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib_path = tmp.path().join("lib.circom");
+    // On disk: the template is named OldName.
+    std::fs::write(
+        &lib_path,
+        "pragma circom 2.0.0;\ntemplate OldName() { signal input x; signal output y; y <== x; }\n",
+    )
+    .unwrap();
+    let lib_uri = format!("file://{}", lib_path.display());
+
+    let root_path = tmp.path().join("root.circom");
+    let root_src = "pragma circom 2.0.0;\n\
+                    include \"lib.circom\";\n\
+                    template Root() {\n\
+                        signal output o;\n\
+                        component c = NewName();\n\
+                        c.x <== 1;\n\
+                        o <== c.y;\n\
+                    }\n";
+    std::fs::write(&root_path, root_src).unwrap();
+    let root_uri = format!("file://{}", root_path.display());
+
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+
+    // Open the lib in another tab with a renamed template — simulating
+    // an unsaved rename. The LSP must see NewName, not OldName.
+    let edited_lib = "pragma circom 2.0.0;\ntemplate NewName() { signal input x; signal output y; y <== x; }\n";
+    client.open_doc(&lib_uri, edited_lib).await;
+    let _ = drain_diagnostics_for(&mut client, &lib_uri).await;
+
+    client.open_doc(&root_uri, root_src).await;
+    let diags = drain_diagnostics_for(&mut client, &root_uri).await;
+    let undeclared_newname: Vec<&Value> = diags
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("NewName"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        undeclared_newname.is_empty(),
+        "NewName should resolve to the open buffer, not the on-disk OldName: {undeclared_newname:?}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn goto_definition_jumps_to_unopened_included_file() {
+    // Regression: F12 on a symbol defined in an `include`d file that
+    // is NOT open in another tab must return a Location with the
+    // correct file:// URI and the correct line/column within that
+    // file's text — not the current file's URI with a misaligned span.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib_path = tmp.path().join("lib.circom");
+    // Three lines of preamble so the template name is at a non-trivial
+    // line number — a line/col bug would land on line 0 instead.
+    let lib_src = "// header line\n\
+                   // header line\n\
+                   pragma circom 2.0.0;\n\
+                   template TargetTpl() { signal input x; signal output y; y <== x; }\n";
+    std::fs::write(&lib_path, lib_src).unwrap();
+    let lib_uri = format!("file://{}", lib_path.display());
+
+    let root_path = tmp.path().join("root.circom");
+    let root_src = "pragma circom 2.0.0;\n\
+                    include \"lib.circom\";\n\
+                    template Root() {\n\
+                        signal output o;\n\
+                        component c = TargetTpl();\n\
+                        c.x <== 1;\n\
+                        o <== c.y;\n\
+                    }\n";
+    std::fs::write(&root_path, root_src).unwrap();
+    let root_uri = format!("file://{}", root_path.display());
+
+    let mut client = InProcessClient::spawn();
+    client.initialize().await;
+    client.open_doc(&root_uri, root_src).await;
+    // Drain any pending diagnostics so they don't confuse later reads.
+    let _ = drain_diagnostics_for(&mut client, &root_uri).await;
+
+    // Cursor on "TargetTpl" usage at line 4 (0-indexed), col 22.
+    let resp = client
+        .request(
+            "textDocument/definition",
+            Some(json!({
+                "textDocument": { "uri": &root_uri },
+                "position": { "line": 4, "character": 22 },
+            })),
+        )
+        .await;
+
+    let result = &resp["result"];
+    assert!(!result.is_null(), "expected a definition location");
+    assert_eq!(
+        result["uri"].as_str(),
+        Some(lib_uri.as_str()),
+        "definition should point at lib.circom, not root.circom: {result}"
+    );
+    // The template name is on line 3 of lib_src (0-indexed).
+    assert_eq!(
+        result["range"]["start"]["line"], 3,
+        "definition should land on line 3 of lib.circom: {result}"
+    );
+
+    client.shutdown_and_exit().await;
+}
+
+#[tokio::test]
+async fn library_paths_resolve_includes_outside_source_dir() {
+    // The included file lives in a *different* directory from the root.
+    // It's only discoverable via `cinccino.libraryPaths`.
+    let tmp = tempfile::tempdir().unwrap();
+    let lib_dir = tmp.path().join("vendor");
+    std::fs::create_dir(&lib_dir).unwrap();
+    let lib_path = lib_dir.join("vendored.circom");
+    std::fs::write(
+        &lib_path,
+        "pragma circom 2.0.0;\ntemplate Vendored() { signal input x; signal output y; y <== x; }\n",
+    )
+    .unwrap();
+
+    let src_dir = tmp.path().join("src");
+    std::fs::create_dir(&src_dir).unwrap();
+    let root_path = src_dir.join("root.circom");
+    let root_src = "pragma circom 2.0.0;\n\
+                    include \"vendored.circom\";\n\
+                    template Root() {\n\
+                        signal output o;\n\
+                        component c = Vendored();\n\
+                        c.x <== 1;\n\
+                        o <== c.y;\n\
+                    }\n";
+    std::fs::write(&root_path, root_src).unwrap();
+    let root_uri = format!("file://{}", root_path.display());
+
+    let mut client = InProcessClient::spawn();
+    // Custom initialize with libraryPaths pointing at vendor/.
+    let resp = client
+        .request(
+            "initialize",
+            Some(json!({
+                "processId": null,
+                "rootUri": null,
+                "capabilities": {},
+                "initializationOptions": {
+                    "libraryPaths": [lib_dir.to_string_lossy()],
+                },
+            })),
+        )
+        .await;
+    assert!(resp.get("error").is_none(), "initialize errored: {resp}");
+    client.notify("initialized", Some(json!({}))).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    client.open_doc(&root_uri, root_src).await;
+    let diags = drain_diagnostics_for(&mut client, &root_uri).await;
+    let undeclared: Vec<&Value> = diags
+        .iter()
+        .filter(|d| {
+            d["message"]
+                .as_str()
+                .map(|m| m.contains("undeclared"))
+                .unwrap_or(false)
+        })
+        .collect();
+    assert!(
+        undeclared.is_empty(),
+        "expected libraryPaths to resolve 'vendored.circom', got: {undeclared:?}"
     );
 
     client.shutdown_and_exit().await;
